@@ -1,0 +1,389 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>openplay</title>
+<style>
+  :root {
+    --bg: #f4f5f7; --card: #fff; --text: #15171c; --muted: #6a7280; --border: #e3e6eb;
+    --field: #f7f8fa; --accent: #2f6fed; --accent-text: #fff;
+    --live: #17a34a; --warn: #d98a06; --err: #d93636; --idle: #8a93a3;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #0e1014; --card: #171a20; --text: #e7e9ee; --muted: #959eae; --border: #272c35;
+      --field: #1e222a; --accent: #4d86ff; --idle: #6d7584;
+    }
+  }
+  * { box-sizing: border-box; }
+  [hidden] { display: none !important; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font: 15px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif;
+  }
+  main { max-width: 560px; margin: 0 auto; padding: 28px 16px 48px; }
+  header { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 20px; }
+  h1 { font-size: 20px; margin: 0; letter-spacing: -0.01em; }
+  .pill {
+    display: inline-flex; align-items: center; gap: 8px; padding: 5px 12px; border-radius: 999px;
+    background: var(--card); border: 1px solid var(--border); font-size: 13px; font-variant-numeric: tabular-nums;
+  }
+  .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--idle); }
+  .live .dot { background: var(--live); box-shadow: 0 0 0 4px color-mix(in srgb, var(--live) 25%, transparent); }
+  .starting .dot { background: var(--warn); animation: blink 1s infinite; }
+  .error .dot { background: var(--err); }
+  @keyframes blink { 50% { opacity: .3; } }
+  section {
+    background: var(--card); border: 1px solid var(--border); border-radius: 14px;
+    padding: 16px 18px; margin-bottom: 14px;
+  }
+  h2 { font-size: 12px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); margin: 0 0 12px; font-weight: 600; }
+  .row { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 8px 0; }
+  .row + .row { border-top: 1px solid var(--border); }
+  .row label { font-weight: 500; }
+  .hint { display: block; font-size: 12.5px; color: var(--muted); font-weight: 400; }
+  select, input[type=number], input[type=text] {
+    font: inherit; color: var(--text); background: var(--field); border: 1px solid var(--border);
+    border-radius: 8px; padding: 6px 10px; min-width: 0;
+  }
+  select { max-width: 60%; }
+  input[type=number] { width: 72px; }
+  input[type=range] { width: 150px; accent-color: var(--accent); }
+  .range { display: flex; align-items: center; gap: 10px; font-variant-numeric: tabular-nums; }
+  .device { display: flex; gap: 8px; }
+  .device select, .device input { flex: 1; max-width: none; }
+  section > .hint { margin-top: 8px; }
+  button {
+    font: inherit; font-weight: 600; border-radius: 10px; border: 1px solid var(--border);
+    background: var(--field); color: var(--text); padding: 7px 14px; cursor: pointer;
+  }
+  button:disabled { opacity: .5; cursor: default; }
+  .actions { display: flex; gap: 10px; margin-top: 18px; }
+  .actions button { flex: 1; padding: 12px; font-size: 16px; }
+  .primary { background: var(--accent); color: var(--accent-text); border-color: var(--accent); }
+  .danger { background: var(--err); color: #fff; border-color: var(--err); }
+  .switch { position: relative; width: 44px; height: 26px; flex: none; }
+  .switch input { opacity: 0; width: 0; height: 0; }
+  .switch span { position: absolute; inset: 0; background: var(--border); border-radius: 999px; transition: .15s; cursor: pointer; }
+  .switch span::after { content: ""; position: absolute; top: 3px; left: 3px; width: 20px; height: 20px; background: #fff; border-radius: 50%; transition: .15s; }
+  .switch input:checked + span { background: var(--accent); }
+  .switch input:checked + span::after { transform: translateX(18px); }
+  .switch input:focus-visible + span { outline: 2px solid var(--accent); outline-offset: 2px; }
+  #error {
+    display: none; margin-top: 14px; padding: 10px 14px; border-radius: 10px;
+    background: color-mix(in srgb, var(--err) 12%, transparent); color: var(--err); font-size: 14px;
+  }
+  #note { text-align: center; color: var(--muted); font-size: 13px; margin-top: 14px; }
+  .buttons { display: flex; gap: 8px; flex: none; }
+  .tabs {
+    display: flex; gap: 4px; padding: 4px; margin-bottom: 14px; border-radius: 12px;
+    background: var(--field); border: 1px solid var(--border);
+  }
+  .tabs button { flex: 1; border: 0; background: none; color: var(--muted); padding: 6px; }
+  .tabs button[aria-selected=true] { background: var(--card); color: var(--text); box-shadow: 0 1px 2px rgb(0 0 0 / .12); }
+  .item { min-width: 0; overflow-wrap: anywhere; font-weight: 500; }
+  .row > button { flex: none; }
+  footer { color: var(--muted); font-size: 12.5px; margin-top: 22px; text-align: center; }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <h1>openplay</h1>
+    <span class="pill" id="pill"><span class="dot"></span><span id="status">Idle</span></span>
+  </header>
+
+  <nav class="tabs" role="tablist">
+    <button role="tab" id="tab-home" aria-controls="home" aria-selected="true">Home</button>
+    <button role="tab" id="tab-history" aria-controls="history" aria-selected="false">History</button>
+  </nav>
+
+  <div id="history" role="tabpanel" hidden>
+    <section>
+      <h2>Recently played</h2>
+      <div id="history-list"></div>
+      <span class="hint" id="history-empty">Videos you play show up here.</span>
+    </section>
+  </div>
+
+  <div id="home" role="tabpanel">
+  <section>
+    <h2>Device</h2>
+    <div class="device">
+      <select id="device" aria-label="TV"></select>
+      <button id="scan">Scan</button>
+    </div>
+  </section>
+
+  <section>
+    <h2>Play a video</h2>
+    <div class="device">
+      <input type="text" id="source" placeholder="File path, URL, magnet link or .torrent" aria-label="Video to play">
+      <button id="play">Play</button>
+    </div>
+    <div class="row" id="episode-row" style="display: none">
+      <label for="episode">Episode</label>
+      <select id="episode"></select>
+    </div>
+    <div class="row" id="subtitle-row" style="display: none">
+      <label for="subtitle">Subtitles<span class="hint">Your pick's language is picked again next time</span></label>
+      <select id="subtitle"></select>
+    </div>
+    <div class="row">
+      <label for="upload-button">Subtitle files<span class="hint" id="uploaded"></span></label>
+      <span class="buttons">
+        <button id="clear-subs">Remove</button>
+        <button id="upload-button">Add…</button>
+        <input type="file" id="upload" accept=".srt,.ass,.ssa,.vtt" multiple hidden>
+      </span>
+    </div>
+    <div class="row">
+      <label for="clear-downloads">Downloads<span class="hint" id="downloads"></span></label>
+      <button id="clear-downloads">Delete</button>
+    </div>
+    <span class="hint">Torrents play while they download, into the downloads folder. Anything the TV can't
+      play as it is gets converted with the resolution and bitrate below. Subtitles come from the video
+      and from subtitle files beside it or in the torrent.</span>
+  </section>
+
+  <section>
+    <h2>Picture</h2>
+    <div class="row">
+      <label for="display">Display<span class="hint">0 is usually your main screen</span></label>
+      <input type="number" id="display" min="0" max="8">
+    </div>
+    <div class="row">
+      <label for="height">Resolution</label>
+      <select id="height"><option value="1080">1080p</option><option value="720">720p</option></select>
+    </div>
+    <div class="row">
+      <label for="fps">Frame rate<span class="hint">Use 25 if your TV runs at 50 Hz</span></label>
+      <select id="fps"><option value="30">30 fps</option><option value="25">25 fps</option><option value="24">24 fps</option><option value="15">15 fps</option></select>
+    </div>
+    <div class="row">
+      <label for="bitrate">Bitrate<span class="hint">Higher is sharper, needs better Wi-Fi</span></label>
+      <span class="range"><input type="range" id="bitrate" min="2" max="12" step="1"><output id="bitrate-out"></output></span>
+    </div>
+    <div class="row">
+      <label for="segment">Segment length<span class="hint">Longer can be smoother, adds a little delay</span></label>
+      <select id="segment"><option value="0.5">0.5 s</option><option value="1">1 s</option><option value="2">2 s</option></select>
+    </div>
+  </section>
+
+  <section>
+    <h2>Sound</h2>
+    <div class="row">
+      <label for="audio">Send sound</label>
+      <label class="switch"><input type="checkbox" id="audio"><span></span></label>
+    </div>
+    <div class="row">
+      <label for="speaker">Capture from<span class="hint">Default follows your PC's output; switches live</span></label>
+      <select id="speaker"></select>
+    </div>
+  </section>
+
+  <div class="actions" id="actions"></div>
+  </div>
+  <div id="error" role="alert"></div>
+  <div id="note"></div>
+  <footer>Mirroring lags about 3 s on an Apple TV, more on Cast. Back or Menu on the TV remote also stops it.</footer>
+</main>
+
+<script>
+const $ = id => document.getElementById(id);
+const FIELDS = ["device", "display", "height", "fps", "bitrate", "segment", "audio", "speaker", "source"];
+let state = null, filled = false, busy = false, listsKey = "", subsKey = "", episodesKey = "", historyKey = "";
+
+async function api(path, body) {
+  const opts = body === undefined ? {} :
+    { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) };
+  const r = await fetch(path, opts);
+  const data = await r.json();
+  if (!r.ok) throw new Error(data.error || r.statusText);
+  return data;
+}
+
+function form() {
+  return {
+    device: $("device").value, display: +$("display").value, height: +$("height").value,
+    fps: +$("fps").value, bitrate: +$("bitrate").value, segment: +$("segment").value,
+    audio: $("audio").checked, speaker: $("speaker").value, source: $("source").value,
+  };
+}
+
+function fill(s) {
+  for (const k of FIELDS) {
+    const el = $(k);
+    if (el.type === "checkbox") el.checked = s[k]; else el.value = String(s[k]);
+  }
+  $("bitrate-out").textContent = $("bitrate").value + " Mbps";
+  $("speaker").disabled = !$("audio").checked;
+}
+
+function setOptions(sel, items, current) {
+  sel.replaceChildren(...items.map(([value, label]) => new Option(label, value, false, value === current)));
+}
+
+function bytes(n) {
+  return n >= 1e9 ? (n / 1e9).toFixed(1) + " GB" : Math.ceil(n / 1e6) + " MB";
+}
+
+function showTab(tab) {
+  for (const t of ["home", "history"]) {
+    $(t).hidden = t !== tab;
+    $("tab-" + t).setAttribute("aria-selected", t === tab);
+  }
+}
+
+function clock(sec) {
+  const m = Math.floor(sec / 60), s = sec % 60;
+  return `${m}:${String(s).padStart(2, "0")}`;
+}
+
+function render(st) {
+  state = st;
+  const s = st.settings;
+  const key = JSON.stringify([st.devices, st.speakers]);
+  if (key !== listsKey) {
+    listsKey = key;
+    const current = filled ? $("device").value : s.device;
+    const devices = st.devices.map(d => [d.name, `${d.name} · ${d.model} · ${d.address}`]);
+    if (current && !st.devices.some(d => d.name === current)) devices.unshift([current, `${current} (not found)`]);
+    if (!current) devices.unshift(["", devices.length ? "Choose a device…" : "No devices yet, press Scan"]);
+    setOptions($("device"), devices, current);
+    const speaker = filled ? $("speaker").value : s.speaker;
+    setOptions($("speaker"), [["", "Default output"], ...st.speakers.map(n => [n, n])], speaker);
+  }
+  if (!filled) { fill(s); filled = true; }
+
+  const running = st.status === "live" || st.status === "starting";
+  const job = running && st.running ? st.running.job : "idle";
+  const live = job === "media" ? "Playing" : "Live";
+  const labels = { idle: "Idle", starting: "Starting…", live: `${live} · ${clock(st.uptime)}`, error: "Error" };
+  $("pill").className = "pill " + st.status;
+  $("status").textContent = labels[st.status];
+
+  const actions = $("actions");
+  if (actions.dataset.job !== job) {
+    actions.dataset.job = job;
+    actions.replaceChildren(...(job === "mirror" ? [button("Restart", "", start), button("Stop", "danger", stop)]
+      : job === "media" ? [button("Stop", "danger", stop)]
+      : [button("Start mirroring", "primary", start)]));
+  }
+  for (const b of actions.children) b.disabled = busy;
+  $("play").disabled = busy;
+  const subs = st.subtitles || [];
+  $("subtitle-row").style.display = subs.length ? "" : "none";
+  if (JSON.stringify(subs) !== subsKey) {
+    subsKey = JSON.stringify(subs);
+    setOptions($("subtitle"), [["-1", "Off"], ...subs.map((name, i) => [String(i), name])], String(st.subtitle));
+  } else if (document.activeElement !== $("subtitle")) {
+    $("subtitle").value = String(st.subtitle);
+  }
+  const episodes = st.episodes || [];
+  $("episode-row").style.display = episodes.length > 1 ? "" : "none";
+  if (JSON.stringify(episodes) !== episodesKey) {
+    episodesKey = JSON.stringify(episodes);
+    setOptions($("episode"), episodes.map((name, i) => [String(i), name]), String(st.episode));
+  } else if (document.activeElement !== $("episode")) {
+    $("episode").value = String(st.episode);
+  }
+  $("episode").disabled = busy;
+  $("uploaded").textContent = st.uploaded.length ? `${st.uploaded.join(", ")} · used from the next Play`
+    : "Add .srt files for the video above";
+  $("clear-subs").style.display = st.uploaded.length ? "" : "none";
+  $("downloads").textContent = st.downloads ? `${bytes(st.downloads)} kept to replay without downloading again` : "Empty";
+  $("clear-downloads").disabled = busy || !st.downloads || job === "media";
+  if (JSON.stringify(st.history) !== historyKey) {
+    historyKey = JSON.stringify(st.history);
+    $("history-list").replaceChildren(...st.history.map(h => {
+      const row = document.createElement("div"), name = document.createElement("span"), when = document.createElement("span");
+      row.className = "row"; name.className = "item"; when.className = "hint";
+      when.textContent = new Date(h.time * 1000).toLocaleString([], { dateStyle: "medium", timeStyle: "short" });
+      name.append(h.name, when);
+      row.append(name, button("Play", "", () => { showTab("home"); $("source").value = h.source; play(h.episode); }));
+      return row;
+    }));
+    $("history-empty").hidden = st.history.length > 0;
+  }
+  for (const b of $("history-list").querySelectorAll("button")) b.disabled = busy;
+  // The sound source switches live; everything else needs a restart.
+  const changed = job === "mirror" && FIELDS.some(k => k !== "speaker" && k !== "source" && form()[k] != st.running[k]);
+  $("note").textContent = changed ? "Press Restart to apply changes." : st.detail;
+  $("error").style.display = st.error ? "block" : "none";
+  $("error").textContent = st.error;
+}
+
+function button(text, cls, fn) {
+  const b = document.createElement("button");
+  b.textContent = text;
+  if (cls) b.className = cls;
+  b.onclick = fn;
+  return b;
+}
+
+async function act(fn) {
+  busy = true;
+  if (state) render(state);
+  try { render(await fn()); }
+  catch (e) { $("error").style.display = "block"; $("error").textContent = e.message; }
+  finally { busy = false; if (state) render(state); }
+}
+
+const start = () => act(() => api("/api/start", form()));
+const stop = () => act(() => api("/api/stop", {}));
+$("subtitle").onchange = () => act(() => api("/api/subtitle", { index: +$("subtitle").value }));
+// Without an episode, a torrent plays the one picked last time (the first, for a new video).
+const play = episode => act(() => api("/api/play", episode === undefined ? form() : { ...form(), episode }));
+$("play").onclick = () => play();
+$("episode").onchange = () => play(+$("episode").value);
+for (const tab of ["home", "history"]) $("tab-" + tab).onclick = () => showTab(tab);
+
+$("upload-button").onclick = () => $("upload").click();
+$("upload").onchange = () => {
+  const files = [...$("upload").files];
+  $("upload").value = "";
+  act(async () => {
+    let st = state;
+    for (const file of files) {
+      const data = await new Promise((ok, fail) => {  // base64: the server works out the text encoding
+        const r = new FileReader();
+        r.onload = () => ok(r.result.split(",")[1]);
+        r.onerror = () => fail(r.error);
+        r.readAsDataURL(file);
+      });
+      st = await api("/api/upload-subtitle", { ...form(), name: file.name, data });
+    }
+    return st;
+  });
+};
+$("clear-subs").onclick = () => act(() => api("/api/clear-subtitles", form()));
+$("clear-downloads").onclick = () => {
+  if (confirm("Delete everything in the downloads folder? Torrents download from scratch next time."))
+    act(() => api("/api/clear-downloads", {}));
+};
+$("source").addEventListener("keydown", e => { if (e.key === "Enter") $("play").click(); });
+
+$("scan").onclick = async () => {
+  $("scan").disabled = true; $("scan").textContent = "Scanning…";
+  try { render(await api("/api/scan", {})); }
+  finally { $("scan").disabled = false; $("scan").textContent = "Scan"; }
+};
+
+for (const k of FIELDS) {
+  $(k).addEventListener("change", async () => {
+    fill(form());
+    render(await api("/api/settings", form()));
+  });
+}
+$("bitrate").addEventListener("input", () => { $("bitrate-out").textContent = $("bitrate").value + " Mbps"; });
+
+async function poll() {
+  try { render(await api("/api/state")); } catch {}
+  setTimeout(poll, 1000);
+}
+poll();
+</script>
+</body>
+</html>

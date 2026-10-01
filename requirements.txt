@@ -1,0 +1,4 @@
+pyatv==0.18.0
+SoundCard==0.4.6
+PyChromecast==14.0.10
+libtorrent==2.1.1
