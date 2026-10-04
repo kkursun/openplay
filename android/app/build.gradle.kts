@@ -12,8 +12,8 @@ android {
         minSdk = 29 // Android 10: capturing other apps' sound while mirroring
         // 37 would also need ACCESS_LOCAL_NETWORK (Android 17's permission for reaching TVs and the PC)
         targetSdk = 36
-        // Releases are built from tags like v1.2 or v1.2-beta: the tag names the version.
-        val tag = Regex("v((\\d+)(?:\\.(\\d+))?(?:\\.(\\d+))?(?:-[\\w.]+)?)").matchEntire(System.getenv("GITHUB_REF_NAME") ?: "")
+        // Releases name their version, like v1.2 or v1.2-beta (see .github/workflows/android-release.yml).
+        val tag = Regex("v((\\d+)(?:\\.(\\d+))?(?:\\.(\\d+))?(?:-[\\w.]+)?)").matchEntire(System.getenv("OPENPLAY_VERSION") ?: "")
         versionName = tag?.groupValues?.get(1) ?: "1.0"
         versionCode = tag?.groupValues?.drop(2)?.map { it.toIntOrNull() ?: 0 }?.let { (a, b, c) -> a * 10000 + b * 100 + c } ?: 10000
     }

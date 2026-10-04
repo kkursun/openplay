@@ -1,8 +1,16 @@
 name: Android release
 
-# Pushing a tag like v1.1 (or v1.1-beta, published as a pre-release) tests and builds the Android app and
-# publishes a GitHub release with its APKs.
+# Builds the Android app and publishes its APKs as a GitHub release, three ways: run this workflow from the
+# Actions tab with a version (it makes the tag and the release), publish a release on GitHub (its APKs get
+# attached), or push a tag like v1.1. Versions with a dash, like 1.1-beta, are pre-releases.
 on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Version, like 1.1 or 1.1-beta
+        required: true
+  release:
+    types: [published]
   push:
     tags: ["v*"]
 
@@ -15,6 +23,8 @@ jobs:
     defaults:
       run:
         working-directory: android
+    env:
+      OPENPLAY_VERSION: ${{ inputs.version && format('v{0}', inputs.version) || github.event.release.tag_name || github.ref_name }}
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-java@v6
@@ -40,14 +50,19 @@ jobs:
       - name: Publish the release
         env:
           GH_TOKEN: ${{ github.token }}
+          TAG: ${{ env.OPENPLAY_VERSION }}
         run: |
           for apk in app/build/outputs/apk/release/app-*-release.apk; do
             abi=${apk##*/app-}
-            cp "$apk" "openplay-$GITHUB_REF_NAME-${abi%-release.apk}.apk"
+            cp "$apk" "openplay-$TAG-${abi%-release.apk}.apk"
           done
+          if gh release view "$TAG" > /dev/null 2>&1; then
+            gh release upload "$TAG" openplay-*.apk --clobber
+            exit
+          fi
           cat > notes.md <<NOTES
           The openplay Android app, for Android 10 and later: play to the TV from the phone itself, or use the
-          phone as a remote for openplay on a PC (see [android/README.md](https://github.com/$GITHUB_REPOSITORY/blob/$GITHUB_REF_NAME/android/README.md)).
+          phone as a remote for openplay on a PC (see [android/README.md](https://github.com/$GITHUB_REPOSITORY/blob/$TAG/android/README.md)).
 
           Download the APK for your phone's processor and open it (allow installing apps from your browser or
           file manager when asked):
@@ -57,5 +72,5 @@ jobs:
           - **x86_64**: emulators and Chromebooks
           - **universal**: any of them, if unsure (bigger)
           NOTES
-          gh release create "$GITHUB_REF_NAME" openplay-*.apk --verify-tag --title "openplay $GITHUB_REF_NAME" \
-            --notes-file notes.md $([[ "$GITHUB_REF_NAME" == *-* ]] && echo --prerelease)
+          gh release create "$TAG" openplay-*.apk --target "$GITHUB_SHA" --title "openplay $TAG" \
+            --notes-file notes.md $([[ "$TAG" == *-* ]] && echo --prerelease)

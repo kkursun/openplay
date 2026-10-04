@@ -41,8 +41,9 @@ Needs JDK 17+ and the Android SDK (platform 37):
     ./gradlew assembleRelease     # APKs per processor type in app/build/outputs/apk/release/
     ./gradlew testDebugUnitTest   # some tests check the muxer's output with ffmpeg, if installed
 
-Pushing a tag like `v1.1` (or `v1.1-beta`, as a pre-release) has GitHub Actions test, build and
-publish a release; the tag names the version.
+Releases are made by GitHub Actions, which tests, builds and attaches the APKs: run the *Android
+release* workflow from the Actions tab with a version (it makes the tag and the release), publish a
+release on GitHub, or push a tag like `v1.1`. Versions with a dash, like `1.1-beta`, are pre-releases.
 
 Android only updates an app with an APK signed by the same key. Without one of your own, APKs are
 signed with the building machine's debug key, which differs from machine to machine (GitHub's
