@@ -1,0 +1,61 @@
+name: Android release
+
+# Pushing a tag like v1.1 (or v1.1-beta, published as a pre-release) tests and builds the Android app and
+# publishes a GitHub release with its APKs.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: android
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: 21
+      - name: Android 17 SDK, and ffmpeg for the tests that check the muxer's output
+        run: |
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "platforms;android-37.0" > /dev/null
+          sudo apt-get update -q && sudo apt-get install -yq ffmpeg > /dev/null
+      - name: Signing key from the repository's secrets, if it has one
+        env:
+          KEYSTORE: ${{ secrets.OPENPLAY_KEYSTORE_BASE64 }}
+        run: |
+          if [ -n "$KEYSTORE" ]; then
+            echo "$KEYSTORE" | base64 -d > "$RUNNER_TEMP/openplay.p12"
+            echo "OPENPLAY_KEYSTORE=$RUNNER_TEMP/openplay.p12" >> "$GITHUB_ENV"
+          fi
+      - name: Test and build
+        env:
+          OPENPLAY_KEY_PASSWORD: ${{ secrets.OPENPLAY_KEY_PASSWORD }}
+        run: ./gradlew --no-daemon testDebugUnitTest assembleRelease
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          for apk in app/build/outputs/apk/release/app-*-release.apk; do
+            abi=${apk##*/app-}
+            cp "$apk" "openplay-$GITHUB_REF_NAME-${abi%-release.apk}.apk"
+          done
+          cat > notes.md <<NOTES
+          The openplay Android app, for Android 10 and later: play to the TV from the phone itself, or use the
+          phone as a remote for openplay on a PC (see [android/README.md](https://github.com/$GITHUB_REPOSITORY/blob/$GITHUB_REF_NAME/android/README.md)).
+
+          Download the APK for your phone's processor and open it (allow installing apps from your browser or
+          file manager when asked):
+
+          - **arm64-v8a**: nearly every phone from the last several years
+          - **armeabi-v7a**: older 32-bit phones
+          - **x86_64**: emulators and Chromebooks
+          - **universal**: any of them, if unsure (bigger)
+          NOTES
+          gh release create "$GITHUB_REF_NAME" openplay-*.apk --verify-tag --title "openplay $GITHUB_REF_NAME" \
+            --notes-file notes.md $([[ "$GITHUB_REF_NAME" == *-* ]] && echo --prerelease)

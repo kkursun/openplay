@@ -25,17 +25,30 @@ The phone has no ffmpeg, so it never re-encodes video:
 - Subtitle tracks inside a video aren't extracted; subtitle files (`.srt`, `.ass`, `.ssa`, `.vtt`) are.
 - AirPlay 2 devices that require pairing (newer Apple TVs, Macs) only work from the PC.
 
+## Install
+
+Download the APK for your phone from the repository's
+[Releases](https://github.com/kkursun/openplay/releases) (arm64-v8a fits nearly every recent phone)
+and open it, allowing installs from unknown sources when asked. Android 10 or later.
+
+Mirroring asks for screen sharing (and the microphone permission, which Android requires for
+capturing other apps' sound); the notification while streaming has a Stop button.
+
 ## Build
 
 Needs JDK 17+ and the Android SDK (platform 37):
 
-    ./gradlew assembleRelease     # app/build/outputs/apk/release/app-release.apk
+    ./gradlew assembleRelease     # APKs per processor type in app/build/outputs/apk/release/
     ./gradlew testDebugUnitTest   # some tests check the muxer's output with ffmpeg, if installed
 
-The release APK is signed with the building machine's debug key, for installing by hand (allow
-installs from unknown sources). An APK built on another machine has another signature, so Android
-won't update one with the other: uninstall first.
+Pushing a tag like `v1.1` (or `v1.1-beta`, as a pre-release) has GitHub Actions test, build and
+publish a release; the tag names the version.
 
-Android 10 or later. Mirroring asks for screen sharing (and the microphone permission, which
-Android requires for capturing other apps' sound); the notification while streaming has a Stop
-button.
+Android only updates an app with an APK signed by the same key. Without one of your own, APKs are
+signed with the building machine's debug key, which differs from machine to machine (GitHub's
+included), so updating means uninstalling first. To sign every release alike, make a key:
+
+    keytool -genkeypair -alias openplay -keyalg RSA -validity 10000 -storetype PKCS12 -keystore openplay.p12
+
+and add it to the repository's Actions secrets as `OPENPLAY_KEYSTORE_BASE64` (`base64 -w0 openplay.p12`)
+and `OPENPLAY_KEY_PASSWORD`. Locally, set `OPENPLAY_KEYSTORE` to the file and `OPENPLAY_KEY_PASSWORD`.

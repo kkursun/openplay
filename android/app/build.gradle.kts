@@ -12,10 +12,32 @@ android {
         minSdk = 29 // Android 10: capturing other apps' sound while mirroring
         // 37 would also need ACCESS_LOCAL_NETWORK (Android 17's permission for reaching TVs and the PC)
         targetSdk = 36
-        versionCode = 1
-        versionName = "1.0"
-        ndk {
-            abiFilters += listOf("arm64-v8a", "armeabi-v7a", "x86_64") // the ones libtorrent4j is built for
+        // Releases are built from tags like v1.2 or v1.2-beta: the tag names the version.
+        val tag = Regex("v((\\d+)(?:\\.(\\d+))?(?:\\.(\\d+))?(?:-[\\w.]+)?)").matchEntire(System.getenv("GITHUB_REF_NAME") ?: "")
+        versionName = tag?.groupValues?.get(1) ?: "1.0"
+        versionCode = tag?.groupValues?.drop(2)?.map { it.toIntOrNull() ?: 0 }?.let { (a, b, c) -> a * 10000 + b * 100 + c } ?: 10000
+    }
+
+    // An APK per processor type, a third the size of one with all of libtorrent's native code (plus that one).
+    splits {
+        abi {
+            isEnable = true
+            reset()
+            include("arm64-v8a", "armeabi-v7a", "x86_64") // the ones libtorrent4j is built for
+            isUniversalApk = true
+        }
+    }
+
+    // A key of your own, to sign every release the same way (Android only updates an app with the key it was
+    // installed with): OPENPLAY_KEYSTORE is its file, OPENPLAY_KEY_PASSWORD its password, alias "openplay".
+    // Without one, the building machine's debug key signs, which is fine for installing by hand.
+    val keystore = System.getenv("OPENPLAY_KEYSTORE")?.takeIf { it.isNotEmpty() }
+    signingConfigs {
+        if (keystore != null) create("own") {
+            storeFile = file(keystore)
+            storePassword = System.getenv("OPENPLAY_KEY_PASSWORD")
+            keyAlias = "openplay"
+            keyPassword = System.getenv("OPENPLAY_KEY_PASSWORD")
         }
     }
 
@@ -24,8 +46,7 @@ android {
             isMinifyEnabled = true
             isShrinkResources = true
             proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
-            // Installed by hand, not from a store: signed with the building machine's debug key.
-            signingConfig = signingConfigs.getByName("debug")
+            signingConfig = signingConfigs.getByName(if (keystore != null) "own" else "debug")
         }
     }
     compileOptions {
