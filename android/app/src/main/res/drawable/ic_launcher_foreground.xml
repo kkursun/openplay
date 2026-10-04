@@ -1,0 +1,13 @@
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <!-- A TV with a play triangle, inside the adaptive icon's 66dp safe zone -->
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:pathData="M30,34h48a4,4 0,0 1,4 4v28a4,4 0,0 1,-4 4H60v4h8v4H40v-4h8v-4H30a4,4 0,0 1,-4 -4V38a4,4 0,0 1,4 -4zM31,39v26h46V39z" />
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:pathData="M48,44l14,8l-14,8z" />
+</vector>
