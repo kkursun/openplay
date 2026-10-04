@@ -5,11 +5,14 @@ Xiaomi TV box, from a web dashboard.
 The TV plays an HLS stream or a file that this script serves, so no FairPlay or PIN pairing is needed.
 Mirroring lags ~3 s on an Apple TV 3 (its player keeps ~2 s buffered no matter what), more on Cast.
 Run: python mirror.py, then open http://localhost:8000
+The openplay Android app can also drive it from a phone on the same network, with the pairing code the
+dashboard shows.
 """
 import asyncio
 import base64
 import functools
 import hashlib
+import hmac
 import http.client
 import json
 import math
@@ -18,6 +21,7 @@ import os
 import plistlib
 import queue
 import re
+import secrets
 import shutil
 import socket
 import subprocess
@@ -35,6 +39,7 @@ import libtorrent as lt
 import pyatv
 import pychromecast
 import soundcard as sc
+import zeroconf
 from pyatv.auth.hap_pairing import NO_CREDENTIALS
 from pyatv.const import Protocol
 from pyatv.exceptions import AuthenticationError, ConnectionLostError
@@ -51,6 +56,7 @@ WINDOWS = sys.platform == "win32"
 FFMPEG = str(HERE / "ffmpeg.exe") if WINDOWS else "ffmpeg"
 SETTINGS_FILE = HERE / "settings.json"
 HISTORY_FILE = HERE / "history.json"
+REMOTE_FILE = HERE / "remote.json"  # the pairing code phones use
 UPLOADS = HERE / "subtitles"  # subtitle files added from the dashboard, a folder per video
 # Torrents are kept here after playing, so playing one again resumes instead of starting over.
 DOWNLOADS = HERE / "downloads"
@@ -65,6 +71,7 @@ LIMITS = {"display": (0, 8), "height": (360, 1080), "fps": (10, 30), "bitrate": 
 HLS = "application/vnd.apple.mpegurl"
 SEGMENT = 4  # seconds of video in each HLS segment of a converted video
 HLS_TYPES = {".m3u8": HLS, ".ts": "video/mp2t", ".m4s": "video/iso.segment", ".mp4": "video/mp4", ".vtt": "text/vtt"}
+CODE_LETTERS = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"  # no 0/O or 1/I to mix up
 SUBTITLE_FILES = {".srt", ".ass", ".ssa", ".vtt"}
 VIDEO_FILES = {".mkv", ".mp4", ".m4v", ".avi", ".mov", ".webm", ".ts", ".m2ts", ".wmv", ".mpg"}
 TEXT_SUBTITLES = {"subrip", "ass", "ssa", "mov_text", "webvtt", "text"}  # not pictures (PGS, VobSub): no text to send
@@ -113,6 +120,37 @@ def local_ip(target):
     with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
         s.connect((target, 7000))
         return s.getsockname()[0]
+
+
+def lan_ip():
+    """This PC's address on the network (the one its default route leaves from)."""
+    try:
+        return local_ip("10.255.255.255")
+    except OSError:  # no network
+        return "127.0.0.1"
+
+
+def pairing_code():
+    """A code like "K7QF-M2XA-P9RD" that pairs a phone: 60 bits, far too many to guess over the network."""
+    code = "".join(secrets.choice(CODE_LETTERS) for _ in range(12))
+    return "-".join(code[i:i + 4] for i in range(0, 12, 4))
+
+
+def paired(authorization, code):
+    """Whether an Authorization header ("Bearer <code>") carries the pairing code. Case and dashes don't matter."""
+    letters = lambda text: re.sub(r"[^A-Z0-9]", "", text.upper())
+    return bool(code) and hmac.compare_digest(letters(authorization.removeprefix("Bearer ")), letters(code))
+
+
+def advertise(zc):
+    """Announce this server on mDNS as _openplay._tcp, where the phone app looks for it."""
+    # ponytail: the address is the one at startup; restart after moving to another network
+    info = zeroconf.ServiceInfo("_openplay._tcp.local.", f"{socket.gethostname()[:40]}._openplay._tcp.local.",
+                                port=PORT, parsed_addresses=[lan_ip()])
+    try:
+        zc.register_service(info, allow_name_change=True)
+    except (OSError, zeroconf.Error):
+        pass  # the app can still be given the address by hand
 
 
 def served(tv, path):
@@ -757,6 +795,10 @@ class Mirror:
             self.history = json.loads(HISTORY_FILE.read_text())  # {"source", "episode", "name", "time"}, newest first
         except (OSError, ValueError):
             self.history = []
+        try:
+            self.code = json.loads(REMOTE_FILE.read_text())["code"]
+        except (OSError, ValueError, KeyError, TypeError):
+            self.new_code()
         self.devices = {}
         self.speakers = [x.name for x in sc.all_speakers()]
         self.status, self.error, self.since = "idle", "", 0.0
@@ -777,6 +819,11 @@ class Mirror:
     def call(self, coro):
         return asyncio.run_coroutine_threadsafe(coro, self.loop).result()
 
+    def new_code(self):
+        """Pair phones afresh: ones paired with the old code need the new one."""
+        self.code = pairing_code()
+        REMOTE_FILE.write_text(json.dumps({"code": self.code}))
+
     def update(self, new):
         new = clean(new)
         if new.get("source", self.settings["source"]) != self.settings["source"]:
@@ -790,7 +837,7 @@ class Mirror:
         detail = [file.describe() if file else "",
                   "Subtitles: hold the center button on the Apple TV remote to pick" if pick_on_tv else ""]
         return {
-            "status": self.status, "error": self.error,
+            "status": self.status, "error": self.error, "computer": socket.gethostname(),
             "uptime": int(time.time() - self.since) if self.status == "live" else 0,
             "detail": " · ".join(x for x in detail if x),
             "subtitles": [sub["name"] for sub in self.subtitles] if tv and tv.picks_subtitles else [],
@@ -997,22 +1044,34 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def from_dashboard(self):
-        # The server listens on the LAN for the TV, but the controls stay on this machine.
+        # The server listens on the LAN for the TV, but the controls stay on this machine (and paired phones).
         # Checking Host also stops DNS-rebinding pages from reaching the API.
         host = self.headers.get("Host", "").rsplit(":", 1)[0]
         return self.client_address[0] == "127.0.0.1" and host in ("localhost", "127.0.0.1")
+
+    def from_phone(self):
+        # The phone app sends the pairing code. Web pages can't send that header to another site without a
+        # CORS preflight, which this server never approves.
+        return paired(self.headers.get("Authorization", ""), M.code)
+
+    def state(self, local):
+        st = M.state()
+        if local:  # only the PC's own screen shows how to pair
+            st["remote"] = {"code": M.code, "url": f"http://{lan_ip()}:{PORT}"}
+        return st
 
     def do_GET(self):
         if self.path.startswith("/hls/"):
             return self.hls(self.path[len("/hls/"):])
         if self.path.startswith("/media/"):
             return self.media()
-        if not self.from_dashboard():
+        local = self.from_dashboard()
+        if not (local or self.from_phone()):
             return self.send_error(403)
-        if self.path == "/":
+        if self.path == "/" and local:
             self.send((HERE / "dashboard.html").read_bytes(), "text/html; charset=utf-8")
         elif self.path == "/api/state":
-            self.send(M.state())
+            self.send(self.state(local))
         else:
             self.send_error(404)
 
@@ -1089,7 +1148,8 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         # Requiring JSON forces a CORS preflight, which this server never approves,
         # so other websites open in the browser can't drive the API.
-        if not self.from_dashboard() or self.headers.get("Content-Type") != "application/json":
+        local = self.from_dashboard()
+        if not (local or self.from_phone()) or self.headers.get("Content-Type") != "application/json":
             return self.send_error(403)
         try:
             body = json.loads(self.rfile.read(int(self.headers.get("Content-Length") or 0)) or b"{}")
@@ -1112,11 +1172,13 @@ class Handler(BaseHTTPRequestHandler):
                 M.call(M.stop())
             elif self.path == "/api/scan":
                 M.call(M.scan())
+            elif self.path == "/api/new-code" and local:
+                M.new_code()
             else:
                 return self.send_error(404)
         except (ValueError, TypeError, AttributeError, KeyError, RuntimeError) as e:
             return self.send({"error": str(e)}, code=400)
-        self.send(M.state())
+        self.send(self.state(local))
 
     def log_message(self, *args):
         pass
@@ -1126,6 +1188,8 @@ if __name__ == "__main__":
     M = Mirror()
     server = ThreadingHTTPServer(("", PORT), Handler)
     asyncio.run_coroutine_threadsafe(M.scan(), M.loop)
+    announcer = zeroconf.Zeroconf()
+    threading.Thread(target=advertise, args=(announcer,), daemon=True).start()  # takes a couple of seconds
     print(f"Dashboard: http://localhost:{PORT}")
     try:
         server.serve_forever()
@@ -1133,3 +1197,4 @@ if __name__ == "__main__":
         pass
     finally:
         M.call(M.stop())
+        announcer.close()

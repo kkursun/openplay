@@ -84,6 +84,7 @@
   .tabs button[aria-selected=true] { background: var(--card); color: var(--text); box-shadow: 0 1px 2px rgb(0 0 0 / .12); }
   .item { min-width: 0; overflow-wrap: anywhere; font-weight: 500; }
   .row > button { flex: none; }
+  .code { font: 600 16px/1.3 ui-monospace, "Cascadia Mono", Consolas, monospace; letter-spacing: .04em; user-select: all; }
   footer { color: var(--muted); font-size: 12.5px; margin-top: 22px; text-align: center; }
 </style>
 </head>
@@ -97,7 +98,26 @@
   <nav class="tabs" role="tablist">
     <button role="tab" id="tab-home" aria-controls="home" aria-selected="true">Home</button>
     <button role="tab" id="tab-history" aria-controls="history" aria-selected="false">History</button>
+    <button role="tab" id="tab-phone" aria-controls="phone" aria-selected="false">Phone</button>
   </nav>
+
+  <div id="phone" role="tabpanel" hidden>
+    <section>
+      <h2>Phone remote</h2>
+      <div class="row">
+        <span class="item">Pairing code<span class="hint">Type it in the openplay app on a phone on this network</span></span>
+        <span class="code" id="remote-code"></span>
+      </div>
+      <div class="row">
+        <span class="item">Address<span class="hint">The app finds this PC by itself; enter this if it doesn't</span></span>
+        <span class="code" id="remote-url"></span>
+      </div>
+      <div class="row">
+        <label for="new-code">New code<span class="hint">Phones paired with the old one stop working until given it</span></label>
+        <button id="new-code">New code</button>
+      </div>
+    </section>
+  </div>
 
   <div id="history" role="tabpanel" hidden>
     <section>
@@ -230,7 +250,7 @@ function bytes(n) {
 }
 
 function showTab(tab) {
-  for (const t of ["home", "history"]) {
+  for (const t of ["home", "history", "phone"]) {
     $(t).hidden = t !== tab;
     $("tab-" + t).setAttribute("aria-selected", t === tab);
   }
@@ -308,6 +328,8 @@ function render(st) {
     $("history-empty").hidden = st.history.length > 0;
   }
   for (const b of $("history-list").querySelectorAll("button")) b.disabled = busy;
+  $("remote-code").textContent = st.remote.code;
+  $("remote-url").textContent = st.remote.url;
   // The sound source switches live; everything else needs a restart.
   const changed = job === "mirror" && FIELDS.some(k => k !== "speaker" && k !== "source" && form()[k] != st.running[k]);
   $("note").textContent = changed ? "Press Restart to apply changes." : st.detail;
@@ -338,7 +360,7 @@ $("subtitle").onchange = () => act(() => api("/api/subtitle", { index: +$("subti
 const play = episode => act(() => api("/api/play", episode === undefined ? form() : { ...form(), episode }));
 $("play").onclick = () => play();
 $("episode").onchange = () => play(+$("episode").value);
-for (const tab of ["home", "history"]) $("tab-" + tab).onclick = () => showTab(tab);
+for (const tab of ["home", "history", "phone"]) $("tab-" + tab).onclick = () => showTab(tab);
 
 $("upload-button").onclick = () => $("upload").click();
 $("upload").onchange = () => {
@@ -362,6 +384,10 @@ $("clear-subs").onclick = () => act(() => api("/api/clear-subtitles", form()));
 $("clear-downloads").onclick = () => {
   if (confirm("Delete everything in the downloads folder? Torrents download from scratch next time."))
     act(() => api("/api/clear-downloads", {}));
+};
+$("new-code").onclick = () => {
+  if (confirm("Make a new pairing code? Phones using the current one stop working until given the new one."))
+    act(() => api("/api/new-code", {}));
 };
 $("source").addEventListener("keydown", e => { if (e.key === "Enter") $("play").click(); });
 

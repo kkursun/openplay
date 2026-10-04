@@ -7,7 +7,14 @@ import tempfile
 from pathlib import Path
 
 from mirror import (FFMPEG, AirPlayTV, CastTV, convert_subtitle, cues_between, episodes, full_playlist, hevc_codec,
-                    language, parse_probe, plan, probe)
+                    language, paired, pairing_code, parse_probe, plan, probe)
+
+# The phone app's pairing code: typed loosely, checked exactly.
+code = pairing_code()
+assert re.fullmatch(r"[A-HJ-NP-Z2-9]{4}(-[A-HJ-NP-Z2-9]{4}){2}", code), code
+assert paired("Bearer " + code, code) and paired("Bearer " + code.lower().replace("-", ""), code)
+assert not paired("Bearer " + code[:-1], code) and not paired("", code) and not paired("Bearer ", "")
+assert pairing_code() != code
 
 # ffmpeg's playlist two segments into a conversion: the TV is shown the whole video, to its last second.
 GROWING = ("#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:4\n#EXT-X-MEDIA-SEQUENCE:0\n"
