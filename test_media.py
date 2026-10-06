@@ -6,8 +6,8 @@ import subprocess
 import tempfile
 from pathlib import Path
 
-from mirror import (FFMPEG, AirPlayTV, CastTV, convert_subtitle, cues_between, episodes, full_playlist, hevc_codec,
-                    language, paired, pairing_code, parse_probe, plan, probe)
+from mirror import (DEFAULTS, FFMPEG, AirPlayTV, CastTV, convert_subtitle, cues_between, episodes, full_playlist,
+                    hevc_codec, language, paired, pairing_code, parse_probe, plan, probe, start_media_ffmpeg)
 
 # The phone app's pairing code: typed loosely, checked exactly.
 code = pairing_code()
@@ -75,6 +75,22 @@ with tempfile.TemporaryDirectory() as tmp:
     assert info["subtitles"] == [("eng", "subrip", False), ("tur", "subrip", True)], info["subtitles"]
     assert language("tur") == ("tr", "Turkish") and language("Movie.2020.en") == ("en", "English")
     assert language("2_Turkish") == ("tr", "Turkish") and language("Director's cut") == ("", "")
+
+    # A TV seeking past what's converted: ffmpeg starts at segment 2 (8 s), timed as if it had come from the start.
+    (tmp / "late.srt").write_text("1\n00:00:09,000 --> 00:00:10,000\nLate\n")
+    subprocess.run([FFMPEG, "-v", "error", "-f", "lavfi", "-i", "testsrc2=size=320x180:duration=12", "-f", "lavfi",
+                    "-i", "sine=duration=12", "-i", str(tmp / "late.srt"), "-map", "0", "-map", "1", "-map", "2",
+                    "-c:v", "libx264", "-c:a", "aac", "-c:s", "srt", str(tmp / "long.mkv")], check=True)
+    info = asyncio.run(probe(str(tmp / "long.mkv")))
+    for tv, first, segment in ((AirPlayTV, 9.4, "live2.ts"), (CastTV, 8, "both.mp4")):  # MPEG-TS starts at 1.4 s
+        out = tmp / tv.segments
+        out.mkdir()
+        assert start_media_ffmpeg(out, str(tmp / "long.mkv"), info, False, False, [0], tv, DEFAULTS, 2).wait() == 0
+        if tv is CastTV:
+            (out / segment).write_bytes((out / "init.mp4").read_bytes() + (out / "live2.m4s").read_bytes())
+        text = subprocess.run([FFMPEG, "-i", str(out / segment)], capture_output=True, text=True).stderr
+        assert abs(float(re.search(r"start: ([\d.]+)", text)[1]) - first) < 0.1, (tv, text)
+        assert "Late" in cues_between((out / "sub0-2.vtt").read_text(encoding="utf-8"), 8, 12)
 
     (tmp / "junk.mp4").write_text("not a video")
     try:
