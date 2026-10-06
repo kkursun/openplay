@@ -70,6 +70,7 @@ DEFAULTS = {"device": "", "display": 0, "height": 1080, "fps": 30, "bitrate": 6,
 LIMITS = {"display": (0, 8), "height": (360, 1080), "fps": (10, 30), "bitrate": (1, 20), "segment": (0.5, 2)}
 HLS = "application/vnd.apple.mpegurl"
 SEGMENT = 4  # seconds of video in each HLS segment of a converted video
+SKIP = 3  # segments past what's converted a TV may seek to and wait for, before ffmpeg restarts there instead
 HLS_TYPES = {".m3u8": HLS, ".ts": "video/mp2t", ".m4s": "video/iso.segment", ".mp4": "video/mp4", ".vtt": "text/vtt"}
 CODE_LETTERS = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"  # no 0/O or 1/I to mix up
 SUBTITLE_FILES = {".srt", ".ass", ".ssa", ".vtt"}
@@ -230,9 +231,13 @@ def start_ffmpeg(out, s, tv):
     ], stdin=subprocess.PIPE)
 
 
-def start_media_ffmpeg(out, source, info, copy_video, copy_audio, subtitles, tv, s):
+def start_media_ffmpeg(out, source, info, copy_video, copy_audio, subtitles, tv, s, start=0):
     """Turn a video into HLS, copying whatever the TV can play as it is, and its subtitle
-    tracks (ffmpeg's numbers for them) into sub0.vtt, sub1.vtt, ..."""
+    tracks (ffmpeg's numbers for them) into sub0.vtt, sub1.vtt, ...
+    From segment start on, if given (the TV skipped ahead): the segments come out as converting from the
+    beginning makes them, but with the playlist in seek.m3u8 and subtitles in subN-<start>.vtt, so the
+    ones converted before stay as they are."""
+    at = ["-output_ts_offset", str(start * SEGMENT)] if start else []
     fps = min(info["fps"] or 30, 30)
     # hvc1: the HEVC tag Apple players insist on, and the one hevc_codec() names.
     video = ["-c:v", "copy", *(["-tag:v", "hvc1"] if info["video"] == "hevc" else [])] if copy_video else [
@@ -244,13 +249,22 @@ def start_media_ffmpeg(out, source, info, copy_video, copy_audio, subtitles, tv,
     audio = ["-c:a", "copy"] if copy_audio else ["-c:a", "aac", "-b:a", "192k", "-ac", "2"]
     # Written as ffmpeg reads along, so subtitles of a torrent still downloading keep coming.
     extract = [arg for n, i in enumerate(subtitles)
-               for arg in ("-map", f"0:s:{i}", "-c:s", "webvtt", "-flush_packets", "1", str(out / f"sub{n}.vtt"))]
+               for arg in ("-map", f"0:s:{i}", "-c:s", "webvtt", "-flush_packets", "1", *at,
+                           str(out / (f"sub{n}-{start}.vtt" if start else f"sub{n}.vtt")))]
+    names = ["-master_pl_name", "master.m3u8", playlist(out)]
+    if start:
+        ext = "m4s" if tv.segments == "fmp4" else "ts"
+        names = ["-start_number", str(start), "-hls_segment_filename", (out / f"live%d.{ext}").as_posix(),
+                 # frag_discont: fMP4 timestamps carry on from the offset, rather than starting over at 0
+                 *(["-hls_segment_options", "movflags=+frag_discont"] if ext == "m4s" else []),
+                 (out / "seek.m3u8").as_posix()]
     return run_ffmpeg(out, [
+        *(["-ss", str(start * SEGMENT)] if start else []),
         # V (not v) skips cover art. Only the first audio track.
-        "-i", source, "-map", "0:V:0?", "-map", "0:a:0?", *video, *audio,
+        "-i", source, "-map", "0:V:0?", "-map", "0:a:0?", *video, *audio, *at,
         # EVENT: segments are only added, so the TV can seek to anything converted so far.
-        "-f", "hls", "-hls_time", str(SEGMENT), "-hls_segment_type", tv.segments, "-master_pl_name", "master.m3u8",
-        "-hls_playlist_type", "event", "-hls_flags", "temp_file", playlist(out),
+        "-f", "hls", "-hls_time", str(SEGMENT), "-hls_segment_type", tv.segments,
+        "-hls_playlist_type", "event", "-hls_flags", "temp_file", *names,
         *extract,
     ])
 
@@ -343,10 +357,11 @@ def video_playlist(out, total):
 
 
 def wait_segment(ffmpeg, out, n, timeout=300):
-    """Block until ffmpeg has written video segment n, or stopped, or timeout seconds passed."""
+    """Block until ffmpeg (a function giving the one running, which a seek may replace) has written
+    video segment n, or stopped, or timeout seconds passed."""
     until = time.monotonic() + timeout
     while not any((out / f"live{n}.{ext}").exists() for ext in ("ts", "m4s")):
-        if ffmpeg.poll() is not None or time.monotonic() > until:
+        if (proc := ffmpeg()) is None or proc.poll() is not None or time.monotonic() > until:
             return
         time.sleep(0.1)
 
@@ -362,8 +377,12 @@ def subtitle_part(out, name, segments, total):
     start = sum(lengths[:segment])
     # ffmpeg's MPEG-TS segments start at 1.4 s; X-TIMESTAMP-MAP lines the cues up with that.
     offset = 126000 if segments == "mpegts" else 0
+    # Conversions started midway write their own subN-<start>.vtt; cues two of them share go out once.
+    files = [out / f"sub{n}.vtt", *out.glob(f"sub{n}-*.vtt")]
+    cues = [cue for f in files
+            for cue in cues_between(f.read_text(encoding="utf-8"), start, start + lengths[segment]).split("\n\n")]
     return (f"WEBVTT\nX-TIMESTAMP-MAP=MPEGTS:{offset},LOCAL:00:00:00.000\n\n"
-            + cues_between((out / f"sub{n}.vtt").read_text(encoding="utf-8"), start, start + lengths[segment]))
+            + "\n\n".join(dict.fromkeys(filter(None, cues))))
 
 
 async def probe(source):
@@ -806,6 +825,9 @@ class Mirror:
         self.running = None  # settings of the current job
         self.out = None
         self.ffmpeg = None
+        self.convert = None  # starts converting the video being played from a segment on
+        self.converting_from = 0  # the segment self.ffmpeg started at
+        self.lock = threading.Lock()  # held while seek() swaps self.ffmpeg
         self.file = None  # LocalFile or Torrent served at /media/<token>
         self.token = ""
         self.tv = None  # the device of the current job
@@ -907,10 +929,12 @@ class Mirror:
             self.subtitles, self.subtitle, self.total = [], -1, 0.0
             if tv:
                 await asyncio.to_thread(tv.close)
-            if self.ffmpeg:
-                self.ffmpeg.kill()
-                self.ffmpeg.wait()
-            file, self.file, self.ffmpeg = self.file, None, None  # unpublish before closing
+            with self.lock:
+                if self.ffmpeg:
+                    self.ffmpeg.kill()
+                    self.ffmpeg.wait()
+                file, self.file, self.ffmpeg = self.file, None, None  # unpublish before closing
+                self.convert, self.converting_from = None, 0
             if file:
                 file.close()
             shutil.rmtree(self.out, ignore_errors=True)
@@ -936,8 +960,9 @@ class Mirror:
             raise RuntimeError("Enter a video file's path, an http(s) URL, a magnet link or a .torrent.")
 
         def problem():
-            if self.ffmpeg and self.ffmpeg.poll() not in (None, 0):
-                return f"ffmpeg stopped: {ffmpeg_log(self.out)}"
+            with self.lock:  # one seek() killed isn't a problem
+                if self.ffmpeg and self.ffmpeg.poll() not in (None, 0):
+                    return f"ffmpeg stopped: {ffmpeg_log(self.out)}"
             return self.file and self.file.problem()
 
         def add_subtitle(name, lang):
@@ -966,7 +991,9 @@ class Mirror:
             if self.file:
                 return served(tv, f"/media/{self.token}{self.file.path.suffix}"), "video/mp4", False, problem
             return source, HLS if "hls" in info["container"] else "video/mp4", False, problem
-        self.ffmpeg = start_media_ffmpeg(self.out, source, info, copy_video, copy_audio, tracks, tv, s)
+        self.convert = functools.partial(start_media_ffmpeg, self.out, source, info, copy_video, copy_audio,
+                                         tracks, tv, s)
+        self.ffmpeg = self.convert()
         # ponytail: copied video is cut at the source's own keyframes, so its segments differ in length and
         # can't be listed ahead: the TV only knows the length converted so far (copying is quick, so that
         # soon catches up). Re-encoding it would fix that, at a cost in quality and GPU time.
@@ -1029,6 +1056,25 @@ class Mirror:
                 raise RuntimeError(f"ffmpeg stopped: {ffmpeg_log(self.out)}")
             await asyncio.sleep(0.2)
 
+    def seek(self, n):
+        """Restart ffmpeg at video segment n if the TV skipped to a part that isn't converted and won't be
+        soon, rather than have it wait for ffmpeg to get there."""
+        with self.lock:
+            out, ffmpeg, first = self.out, self.ffmpeg, self.converting_from
+            if not (self.convert and ffmpeg) or any((out / f"live{n}.{ext}").exists() for ext in ("ts", "m4s")):
+                return
+            try:  # the segment ffmpeg is on: the one after the last in its playlist
+                text = (out / ("seek.m3u8" if first else "live.m3u8")).read_text()
+                done = int(re.findall(r"^live(\d+)\.", text, flags=re.M)[-1]) + 1
+            except (OSError, IndexError):  # none written yet
+                done = first
+            if first <= n <= done + SKIP:
+                return
+            ffmpeg.kill()
+            ffmpeg.wait()
+            (out / "seek.m3u8").unlink(missing_ok=True)  # the last restart's, not this one's
+            self.ffmpeg, self.converting_from = self.convert(n), n
+
 
 class Handler(BaseHTTPRequestHandler):
     def send(self, body, content_type="application/json", code=200, cors=False):
@@ -1088,8 +1134,10 @@ class Handler(BaseHTTPRequestHandler):
         out, total = M.out, M.total
         try:
             # A full playlist lists segments ffmpeg hasn't written yet (a subtitle's cues wait for their video).
-            if total and (m := re.fullmatch(r"(?:live|sub\d+_)(\d+)\.\w+", name)):
-                wait_segment(M.ffmpeg, out, int(m[1]))
+            if total and (m := re.fullmatch(r"(live|sub\d+_)(\d+)\.\w+", name)):
+                if m[1] == "live":  # the TV seeking; subtitles follow the video
+                    M.seek(int(m[2]))
+                wait_segment(lambda: M.ffmpeg, out, int(m[2]))
             if name == "master.m3u8":
                 body = master_playlist(out, M.subtitles).encode()
             elif name.startswith("sub"):
