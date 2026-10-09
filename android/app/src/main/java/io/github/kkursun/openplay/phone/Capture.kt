@@ -40,8 +40,7 @@ class ScreenCapture(
         // when upright, so a landscape video or game fills the TV.
         val height = s.height
         val width = height * 16 / 9
-        encoder = videoEncoder(width, height, strict = true) ?: videoEncoder(width, height, strict = false)
-            ?: throw IllegalStateException("This phone's video encoder won't take ${width}x$height.")
+        encoder = videoEncoder(width, height, s, s.segment)
         val surface = encoder.createInputSurface()
         encoder.start()
         display = projection.createVirtualDisplay("openplay", width, height, dpi,
@@ -55,36 +54,6 @@ class ScreenCapture(
             }
         }
         if (sound) thread("mirror-audio") { pumpAudio() }
-    }
-
-    /** The H.264 encoder, set up for streaming; strict asks for constant bitrate and the Apple TV 3's profile and
-     * level too, which some encoders refuse. */
-    private fun videoEncoder(width: Int, height: Int, strict: Boolean): MediaCodec? {
-        val format = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, width, height).apply {
-            setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface)
-            setInteger(MediaFormat.KEY_BIT_RATE, s.bitrate * 1_000_000)
-            setInteger(MediaFormat.KEY_FRAME_RATE, s.fps)
-            setFloat(MediaFormat.KEY_MAX_FPS_TO_ENCODER, s.fps.toFloat())
-            setFloat(MediaFormat.KEY_I_FRAME_INTERVAL, s.segment.toFloat())
-            // A still screen sends no frames; repeating the last keeps segments coming.
-            setLong(MediaFormat.KEY_REPEAT_PREVIOUS_FRAME_AFTER, 1_000_000L / s.fps)
-            setInteger(MediaFormat.KEY_MAX_B_FRAMES, 0)
-            setInteger(MediaFormat.KEY_PRIORITY, 0) // real time
-            if (strict) {
-                setInteger(MediaFormat.KEY_BITRATE_MODE, MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_CBR)
-                // Encoders pick higher levels on their own; the Apple TV 3 decoder is only rated up to 4.0.
-                setInteger(MediaFormat.KEY_PROFILE, MediaCodecInfo.CodecProfileLevel.AVCProfileHigh)
-                setInteger(MediaFormat.KEY_LEVEL, MediaCodecInfo.CodecProfileLevel.AVCLevel4)
-            }
-        }
-        val codec = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_VIDEO_AVC)
-        return try {
-            codec.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
-            codec
-        } catch (_: Exception) {
-            codec.release()
-            null
-        }
     }
 
     private fun drainVideo() {
@@ -120,13 +89,7 @@ class ScreenCapture(
     private fun pumpAudio() {
         var aac: AacEncoder? = null
         try {
-            val config = AudioPlaybackCaptureConfiguration.Builder(projection)
-                .addMatchingUsage(AudioAttributes.USAGE_MEDIA).addMatchingUsage(AudioAttributes.USAGE_GAME)
-                .addMatchingUsage(AudioAttributes.USAGE_UNKNOWN).build()
-            val format = AudioFormat.Builder().setEncoding(AudioFormat.ENCODING_PCM_16BIT).setSampleRate(RATE)
-                .setChannelMask(AudioFormat.CHANNEL_IN_STEREO).build()
-            val rec = AudioRecord.Builder().setAudioFormat(format).setBufferSizeInBytes(RATE * 4)
-                .setAudioPlaybackCaptureConfig(config).build()
+            val rec = playbackRecorder(projection, RATE)
             record = rec
             rec.startRecording()
             aac = AacEncoder(RATE, 160_000) { frame, pts -> writer.audio(frame, pts) }
@@ -175,4 +138,50 @@ class ScreenCapture(
     }
 
     private fun thread(name: String, body: () -> Unit) = Thread(body, name).apply { isDaemon = true }.start()
+}
+
+/** The H.264 encoder, set up for streaming, with a keyframe every keyframeSeconds. It asks for constant bitrate and
+ * the Apple TV 3's profile and level too, unless the encoder refuses those. */
+fun videoEncoder(width: Int, height: Int, s: PhoneSettings, keyframeSeconds: Double): MediaCodec =
+    videoEncoder(width, height, s, keyframeSeconds, strict = true) ?: videoEncoder(width, height, s, keyframeSeconds, strict = false)
+        ?: throw IllegalStateException("This phone's video encoder won't take ${width}x$height.")
+
+private fun videoEncoder(width: Int, height: Int, s: PhoneSettings, keyframeSeconds: Double, strict: Boolean): MediaCodec? {
+    val format = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, width, height).apply {
+        setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface)
+        setInteger(MediaFormat.KEY_BIT_RATE, s.bitrate * 1_000_000)
+        setInteger(MediaFormat.KEY_FRAME_RATE, s.fps)
+        setFloat(MediaFormat.KEY_MAX_FPS_TO_ENCODER, s.fps.toFloat())
+        setFloat(MediaFormat.KEY_I_FRAME_INTERVAL, keyframeSeconds.toFloat())
+        // A still screen sends no frames; repeating the last keeps segments coming.
+        setLong(MediaFormat.KEY_REPEAT_PREVIOUS_FRAME_AFTER, 1_000_000L / s.fps)
+        setInteger(MediaFormat.KEY_MAX_B_FRAMES, 0)
+        setInteger(MediaFormat.KEY_PRIORITY, 0) // real time
+        if (strict) {
+            setInteger(MediaFormat.KEY_BITRATE_MODE, MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_CBR)
+            // Encoders pick higher levels on their own; the Apple TV 3 decoder is only rated up to 4.0.
+            setInteger(MediaFormat.KEY_PROFILE, MediaCodecInfo.CodecProfileLevel.AVCProfileHigh)
+            setInteger(MediaFormat.KEY_LEVEL, MediaCodecInfo.CodecProfileLevel.AVCLevel4)
+        }
+    }
+    val codec = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_VIDEO_AVC)
+    return try {
+        codec.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
+        codec
+    } catch (_: Exception) {
+        codec.release()
+        null
+    }
+}
+
+/** Records the sound apps play (those that allow it), as 16-bit stereo at rate. Needs the microphone permission. */
+@SuppressLint("MissingPermission")
+fun playbackRecorder(projection: MediaProjection, rate: Int): AudioRecord {
+    val config = AudioPlaybackCaptureConfiguration.Builder(projection)
+        .addMatchingUsage(AudioAttributes.USAGE_MEDIA).addMatchingUsage(AudioAttributes.USAGE_GAME)
+        .addMatchingUsage(AudioAttributes.USAGE_UNKNOWN).build()
+    val format = AudioFormat.Builder().setEncoding(AudioFormat.ENCODING_PCM_16BIT).setSampleRate(rate)
+        .setChannelMask(AudioFormat.CHANNEL_IN_STEREO).build()
+    return AudioRecord.Builder().setAudioFormat(format).setBufferSizeInBytes(rate * 4)
+        .setAudioPlaybackCaptureConfig(config).build()
 }

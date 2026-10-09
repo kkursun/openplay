@@ -1257,7 +1257,9 @@ const (
 	audioSendBurstWindow        = 5 * time.Millisecond
 	maximumAudioPacketsPerBurst = 12
 	maximumAudioPacingFrames    = 1
-	audioPacingRebaseThreshold  = 2 * time.Millisecond
+	// openplay: was 2 ms. Windows timers wake up to ~15 ms late, and every late wakeup moved the
+	// schedule back for good, so audio fell further behind the video. Catch up instead.
+	audioPacingRebaseThreshold = 50 * time.Millisecond
 )
 
 // audioSendBurstLimiter bounds only catch-up bursts. At normal ALAC/AAC-ELD

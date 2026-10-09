@@ -100,6 +100,7 @@ object Phone {
     private var tv: Tv? = null // the device of the current job
     private var file: Source? = null
     private var capture: ScreenCapture? = null
+    private var air: AirMirror? = null
     private var remux: Remuxer? = null
     private var subtitles = emptyList<Subtitle>() // of each subtitle rendition, served from subN.vtt
     private var subtitle = -1 // the one a Cast device is showing, -1 for none
@@ -192,12 +193,13 @@ object Phone {
 
     private suspend fun stop(t: Job) {
         tv?.let { runCatching { it.close() } } // unblocks a TV still connecting
+        air?.stop() // and airmirror waiting on one
         t.cancelAndJoin()
     }
 
     /** The screen-sharing permission ended, from the system's own "Stop sharing" or ours. */
     fun ended(projection: MediaProjection) {
-        if (capture?.projection === projection) stop()
+        if (capture?.projection === projection || air?.projection === projection) stop()
     }
 
     /** Whether a job is running (or about to). */
@@ -215,7 +217,7 @@ object Phone {
             tv = devices[s.device] ?: throw IllegalStateException("Pick a TV first (Scan if the list is empty).")
             this.tv = tv
             val (url, type, problem) = if (job == "mirror") mirror(s, tv, projection!!, sound, out, token) else media(s, tv, out, token)
-            runInterruptible { tv.play(url, type, job == "mirror") }
+            if (url.isNotEmpty()) runInterruptible { tv.play(url, type, job == "mirror") } // none: airmirror plays
             status = "live"
             since = System.currentTimeMillis()
             if (job == "media") remember(s.source, file?.episode ?: 0, file?.name ?: s.source.substringAfterLast('/').substringBefore('?'))
@@ -228,7 +230,7 @@ object Phone {
             while (missing < 8) {
                 delay(1000)
                 problem()?.let { throw IllegalStateException(it) }
-                val alive = runInterruptible { tv.alive() } ?: break
+                val alive = (if (url.isEmpty()) air?.alive() else runInterruptible { tv.alive() }) ?: break
                 missing = if (alive) 0 else missing + 1
                 refresh()
             }
@@ -246,8 +248,9 @@ object Phone {
                 subtitles = emptyList()
                 subtitle = -1
                 tv?.let { runCatching { it.close() } }
-                capture?.stop() ?: projection?.stop()
+                capture?.stop() ?: air?.stop() ?: projection?.stop()
                 capture = null
+                air = null
                 remux?.stop()
                 remux = null
                 file?.close()
@@ -259,6 +262,14 @@ object Phone {
     }
 
     private suspend fun mirror(s: PhoneSettings, tv: Tv, projection: MediaProjection, sound: Boolean, out: File, token: String): Triple<String, String, () -> String?> {
+        // ponytail: arm64 phones only (the ABI airmirror is built for) and the Apple TV 3; others keep HLS
+        val exe = File(context.applicationInfo.nativeLibraryDir, "libairmirror.so")
+        if (tv is AirPlayTv && !tv.needsPairing && exe.exists()) {
+            val air = AirMirror(projection, exe, tv.address, s, context.resources.displayMetrics.densityDpi, sound)
+            this.air = air
+            runInterruptible { air.start() }
+            return Triple("", "", air::problem)
+        }
         val capture = ScreenCapture(projection, out, s, tv.playlistSeconds, context.resources.displayMetrics.densityDpi, sound)
         this.capture = capture
         capture.start()

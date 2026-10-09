@@ -31,6 +31,9 @@ jobs:
         with:
           distribution: temurin
           java-version: 21
+      - uses: actions/setup-go@v7 # builds airmirror, the AirPlay mirroring sender the app runs
+        with:
+          go-version-file: airmirror/go.mod
       - name: Android 17 SDK, and ffmpeg for the tests that check the muxer's output
         run: |
           yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "platforms;android-37.0" > /dev/null

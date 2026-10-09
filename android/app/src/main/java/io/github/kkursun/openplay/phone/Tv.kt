@@ -35,7 +35,7 @@ class AirPlayTv(
     override val address: String,
     private val port: Int,
     override val model: String,
-    private val needsPairing: Boolean,
+    val needsPairing: Boolean,
 ) : Tv {
     // ponytail: H.264 level isn't checked; 30 fps stands in for level 4.0
     override val video = setOf("h264")

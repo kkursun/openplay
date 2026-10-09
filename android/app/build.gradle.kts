@@ -62,7 +62,24 @@ android {
     lint {
         disable += "OldTargetApi" // see targetSdk
     }
+    packaging {
+        jniLibs.useLegacyPackaging = true // installed as files, so airmirror can be run
+    }
 }
+
+// airmirror (the repository's airmirror/: AirPlay screen mirroring, doubletake's sender) for the app to run. Android
+// only lets an app run programs it installs as native libraries, hence the name. Needs Go.
+// ponytail: arm64 only, which Go builds without the NDK; phones of other ABIs mirror over HLS
+val airmirror = tasks.register<Exec>("airmirror") {
+    val src = rootProject.file("../airmirror")
+    val out = file("src/main/jniLibs/arm64-v8a/libairmirror.so")
+    inputs.files(fileTree(src) { include("**/*.go", "go.mod", "go.sum") })
+    outputs.file(out)
+    workingDir = src
+    environment(mapOf("GOOS" to "android", "GOARCH" to "arm64", "CGO_ENABLED" to "0"))
+    commandLine("go", "build", "-trimpath", "-ldflags=-s -w", "-o", out.path, ".")
+}
+tasks.named("preBuild") { dependsOn(airmirror) }
 
 val libtorrent = "2.1.0-39"
 

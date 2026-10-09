@@ -10,6 +10,10 @@ One app, two ways to get something onto the TV:
   Pair once with the code in the dashboard's *Phone* tab; the app finds the PC on the network by
   itself (or type the address the dashboard shows).
 
+Mirroring an Apple TV 3 from an arm64 phone (nearly all of them) uses AirPlay's own screen mirroring,
+through airmirror (the repository's `airmirror/`, built into the app), so it's close to live. Other
+phones and TVs get an HLS stream, a few seconds behind.
+
 Links and videos shared to openplay from other apps (or magnet links opened with it) land in the
 Play box.
 
@@ -36,7 +40,7 @@ capturing other apps' sound); the notification while streaming has a Stop button
 
 ## Build
 
-Needs JDK 17+ and the Android SDK (platform 37):
+Needs JDK 17+, the Android SDK (platform 37) and Go (it builds `../airmirror` into the app):
 
     ./gradlew assembleRelease     # APKs per processor type in app/build/outputs/apk/release/
     ./gradlew testDebugUnitTest   # some tests check the muxer's output with ffmpeg, if installed

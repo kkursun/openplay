@@ -176,9 +176,9 @@ def x11_monitor(index):
         return ["-i", display]
 
 
-def fit(height):
-    """Scale filter that shrinks the picture to fit height (and a 16:9 width), never enlarging it."""
-    return (f"scale='min({height * 16 // 9},iw)':'min({height},ih)'"
+def fit(height, width=None):
+    """Scale filter that shrinks the picture to fit height and width (16:9 by default), never enlarging it."""
+    return (f"scale='min({width or height * 16 // 9},iw)':'min({height},ih)'"
             ":force_original_aspect_ratio=decrease:force_divisible_by=2")
 
 
@@ -242,11 +242,13 @@ def start_airmirror(out, s, tv):
     """Mirror the screen (and sound, fed through stdin) with AirPlay screen mirroring.
     airmirror starts the ffmpeg after "--" once the TV has accepted the session."""
     capture, download = screen(s)
-    encoder = [FFMPEG, "-nostdin", "-loglevel", "warning", *capture, "-vf", download + fit(s["height"]),
+    # {w}x{h}: the TV's screen size, which airmirror fills in. Encoding bigger made the TV scale it itself.
+    encoder = [FFMPEG, "-nostdin", "-loglevel", "warning", *capture, "-vf", download + fit("{h}", "{w}"),
                *h264(s, s["fps"] * 2), "-f", "h264", "-"]
     audio = ["-audio"] if s["audio"] else []
     log = open(out / "ffmpeg.log", "w")  # airmirror's own messages land here too
-    proc = subprocess.Popen([str(AIRMIRROR), "-target", tv.address, *audio, "--", *encoder],
+    proc = subprocess.Popen([str(AIRMIRROR), "-target", tv.address, "-max-height", str(s["height"]), *audio,
+                             "--", *encoder],
                             stdin=subprocess.PIPE, stderr=log)
     log.close()
     return proc
