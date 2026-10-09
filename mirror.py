@@ -3,7 +3,9 @@
 Xiaomi TV box, from a web dashboard.
 
 The TV plays an HLS stream or a file that this script serves, so no FairPlay or PIN pairing is needed.
-Mirroring lags ~3 s on an Apple TV 3 (its player keeps ~2 s buffered no matter what), more on Cast.
+Mirroring an Apple TV 3 instead uses AirPlay's own screen mirroring, through airmirror (doubletake's
+sender, see airmirror/), which skips the ~2 s its player keeps buffered. Elsewhere, and on an Apple TV 3
+if airmirror isn't built, mirroring lags ~3 s, more on Cast.
 Run: python mirror.py, then open http://localhost:8000
 The openplay Android app can also drive it from a phone on the same network, with the pairing code the
 dashboard shows.
@@ -54,6 +56,9 @@ HERE = Path(__file__).parent
 WINDOWS = sys.platform == "win32"
 # Windows needs a recent build for ddagrab: BtbN's win64-gpl ffmpeg.exe placed next to this script.
 FFMPEG = str(HERE / "ffmpeg.exe") if WINDOWS else "ffmpeg"
+# Built with: cd airmirror && go build
+AIRMIRROR = HERE / "airmirror" / ("airmirror.exe" if WINDOWS else "airmirror")
+AIRMIRROR_RATE = 44100  # the PCM airmirror takes: 16-bit stereo at this rate
 SETTINGS_FILE = HERE / "settings.json"
 HISTORY_FILE = HERE / "history.json"
 REMOTE_FILE = HERE / "remote.json"  # the pairing code phones use
@@ -204,17 +209,19 @@ def run_ffmpeg(out, args, stdin=None):
     return proc
 
 
+def screen(s):
+    """ffmpeg input options capturing the screen, and the filter that gets its frames into memory."""
+    if WINDOWS:
+        # Desktop Duplication capture, straight from the GPU.
+        return ["-f", "lavfi", "-i", f"ddagrab=output_idx={s['display']}:framerate={s['fps']}"], "hwdownload,format=bgra,"
+    # ponytail: X11 only; Wayland needs PipeWire portal capture, which ffmpeg can't do yet
+    return ["-f", "x11grab", "-framerate", str(s["fps"]), *x11_monitor(s["display"])], ""
+
+
 def start_ffmpeg(out, s, tv):
     """Capture the screen (and sound, fed through stdin) into a live HLS stream."""
     fps, segment = s["fps"], s["segment"]
-    if WINDOWS:
-        # Desktop Duplication capture, straight from the GPU.
-        capture = ["-f", "lavfi", "-i", f"ddagrab=output_idx={s['display']}:framerate={fps}"]
-        download = "hwdownload,format=bgra,"
-    else:
-        # ponytail: X11 only; Wayland needs PipeWire portal capture, which ffmpeg can't do yet
-        capture = ["-f", "x11grab", "-framerate", str(fps), *x11_monitor(s["display"])]
-        download = ""
+    capture, download = screen(s)
     audio_in = ["-probesize", "32", "-analyzeduration", "0",
                 "-f", "f32le", "-ar", str(RATE), "-ac", "2", "-i", "pipe:0"] if s["audio"] else []
     audio_out = ["-c:a", "aac", "-b:a", "160k"] if s["audio"] else []
@@ -229,6 +236,32 @@ def start_ffmpeg(out, s, tv):
         "-hls_list_size", str(max(2, math.ceil(tv.playlist_seconds / segment))),
         "-hls_flags", "delete_segments+temp_file", playlist(out),
     ], stdin=subprocess.PIPE)
+
+
+def start_airmirror(out, s, tv):
+    """Mirror the screen (and sound, fed through stdin) with AirPlay screen mirroring.
+    airmirror starts the ffmpeg after "--" once the TV has accepted the session."""
+    capture, download = screen(s)
+    encoder = [FFMPEG, "-nostdin", "-loglevel", "warning", *capture, "-vf", download + fit(s["height"]),
+               *h264(s, s["fps"] * 2), "-f", "h264", "-"]
+    audio = ["-audio"] if s["audio"] else []
+    log = open(out / "ffmpeg.log", "w")  # airmirror's own messages land here too
+    proc = subprocess.Popen([str(AIRMIRROR), "-target", tv.address, *audio, "--", *encoder],
+                            stdin=subprocess.PIPE, stderr=log)
+    log.close()
+    return proc
+
+
+def stop_process(proc):
+    """Close stdin first, which airmirror takes as the cue to end the TV's session, then make sure."""
+    if proc.stdin:
+        try:
+            proc.stdin.close()
+            proc.wait(3)
+        except (OSError, ValueError, subprocess.TimeoutExpired):
+            pass
+    proc.kill()
+    proc.wait()
 
 
 def start_media_ffmpeg(out, source, info, copy_video, copy_audio, subtitles, tv, s, start=0):
@@ -430,7 +463,7 @@ def plan(info, tv):
     return copy_video, info["audio"] in (None, *tv.audio)
 
 
-def capture_audio(ffmpeg, wanted, chunks):
+def capture_audio(ffmpeg, wanted, chunks, rate):
     """Record the loopback of the output wanted() names ("" = system default) into chunks.
     Re-checked every second, so switching outputs mid-stream follows along."""
     # On Windows the buffer overflows once while ffmpeg starts up; dropping that stale audio is fine.
@@ -445,33 +478,34 @@ def capture_audio(ffmpeg, wanted, chunks):
         # Exact ids: Windows loopbacks reuse the speaker's id, PulseAudio monitors add ".monitor".
         # (Names aren't safe on Linux: a mic often shares its description with the speakers.)
         mic = sc.get_microphone(source.id if WINDOWS else source.id + ".monitor", include_loopback=True)
-        with mic.recorder(samplerate=RATE, channels=2) as rec:
+        with mic.recorder(samplerate=rate, channels=2) as rec:
             while ffmpeg.poll() is None and pick().id == source.id:
                 until = time.monotonic() + 1
                 while time.monotonic() < until:
                     chunks.put(rec.record(numframes=None))
 
 
-def pump_audio(ffmpeg, wanted):
-    """Feed audio to ffmpeg locked to the wall clock, like the screen capture.
+def pump_audio(ffmpeg, wanted, rate=RATE, pcm16=False):
+    """Feed audio to ffmpeg (float samples) or airmirror (pcm16) locked to the wall clock, like the
+    screen capture.
 
     ffmpeg holds video back until audio for the same moment arrives, so an audio source that
     goes quiet (Linux recorders block while an output delivers nothing) would freeze the stream.
     Here gaps become silence and anything running ahead of the clock is dropped."""
     chunks = queue.SimpleQueue()
-    threading.Thread(target=capture_audio, args=(ffmpeg, wanted, chunks), daemon=True).start()
+    threading.Thread(target=capture_audio, args=(ffmpeg, wanted, chunks, rate), daemon=True).start()
     start, written = time.monotonic(), 0
     try:
         while True:
             time.sleep(0.02)
-            due = int((time.monotonic() - start) * RATE)
+            due = int((time.monotonic() - start) * rate)
             while not chunks.empty():
                 data = chunks.get()
-                if written + len(data) <= due + RATE // 5:  # drop audio >200 ms ahead of the clock
-                    ffmpeg.stdin.write(data.tobytes())
+                if written + len(data) <= due + rate // 5:  # drop audio >200 ms ahead of the clock
+                    ffmpeg.stdin.write((data.clip(-1, 1) * 32767).astype("<i2").tobytes() if pcm16 else data.tobytes())
                     written += len(data)
-            if written < due - RATE // 10:  # >100 ms behind: nothing arrived, fill with silence
-                ffmpeg.stdin.write(bytes(8 * (due - written)))  # 8 bytes = one stereo float32 frame
+            if written < due - rate // 10:  # >100 ms behind: nothing arrived, fill with silence
+                ffmpeg.stdin.write(bytes((4 if pcm16 else 8) * (due - written)))  # bytes in a stereo frame
                 written = due
     except (OSError, ValueError):  # ffmpeg exited
         pass
@@ -900,7 +934,8 @@ class Mirror:
             url, content_type, own_hls, problem = await (self.mirror(s, tv) if job == "mirror"
                                                          else self.media(s, tv))
             self.client = tv.address
-            await asyncio.to_thread(tv.play, url, content_type, job == "mirror", own_hls)
+            if url:  # none when airmirror is already streaming
+                await asyncio.to_thread(tv.play, url, content_type, job == "mirror", own_hls)
             self.status, self.since = "live", time.time()
             if job == "media":
                 self.remember(s["source"], self.file.episode if self.file else 0,
@@ -916,7 +951,10 @@ class Mirror:
                 await asyncio.sleep(1)
                 if trouble := problem():
                     raise RuntimeError(trouble)
-                alive = await asyncio.to_thread(tv.alive)
+                if url:
+                    alive = await asyncio.to_thread(tv.alive)
+                else:
+                    alive = True if self.ffmpeg.poll() is None else None
                 if alive is None:
                     break
                 missing = 0 if alive else missing + 1
@@ -931,8 +969,7 @@ class Mirror:
                 await asyncio.to_thread(tv.close)
             with self.lock:
                 if self.ffmpeg:
-                    self.ffmpeg.kill()
-                    self.ffmpeg.wait()
+                    stop_process(self.ffmpeg)
                 file, self.file, self.ffmpeg = self.file, None, None  # unpublish before closing
                 self.convert, self.converting_from = None, 0
             if file:
@@ -940,12 +977,35 @@ class Mirror:
             shutil.rmtree(self.out, ignore_errors=True)
 
     async def mirror(self, s, tv):
+        # ponytail: Apple TV 3 only; doubletake also mirrors to Macs, untried here, so they keep HLS
+        if isinstance(tv, AirPlayTV) and not tv.v2 and AIRMIRROR.exists():
+            return await self.airmirror(s, tv)
         self.ffmpeg = ffmpeg = start_ffmpeg(self.out, s, tv)
         if s["audio"]:
             speaker = lambda: self.settings["speaker"]  # live, so the dashboard can switch it
             threading.Thread(target=pump_audio, args=(ffmpeg, speaker), daemon=True).start()
         await self.hls_ready()
         return served(tv, "/hls/live.m3u8"), HLS, True, lambda: stream_problem(ffmpeg, self.out, s["segment"])
+
+    async def airmirror(self, s, tv):
+        """Mirror with airmirror, which drives the TV itself: no URL for the TV to play."""
+        self.ffmpeg = proc = start_airmirror(self.out, s, tv)
+        for _ in range(100):  # pairing, FairPlay and SETUP take ~2 s
+            if proc.poll() is not None:
+                raise RuntimeError(f"Mirroring failed: {ffmpeg_log(self.out)}")
+            if "mirroring (data port" in (self.out / "ffmpeg.log").read_text(errors="replace"):
+                break
+            await asyncio.sleep(0.2)
+        else:
+            raise RuntimeError(f"The TV didn't take the mirroring session: {ffmpeg_log(self.out)}")
+        if s["audio"]:  # only now: airmirror doesn't read stdin before, and the backlog would lag
+            speaker = lambda: self.settings["speaker"]
+            threading.Thread(target=pump_audio, args=(proc, speaker, AIRMIRROR_RATE, True), daemon=True).start()
+
+        def problem():  # exit status 0 is a normal end, such as Menu on the remote
+            if proc.poll() not in (None, 0):
+                return f"Mirroring stopped: {ffmpeg_log(self.out)}"
+        return None, None, False, problem
 
     async def media(self, s, tv):
         source = s["source"].strip().strip('"')  # Windows' "Copy as path" adds quotes

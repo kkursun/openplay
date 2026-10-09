@@ -41,7 +41,21 @@ timestamp echoed into bytes 8-16 and our now in bytes 16-32. Note the two clock 
 - video frame header timestamp = the same boot-relative seconds **without** the epoch
   (plus a small playout bias). This is what makes the receiver schedule frames correctly.
 
-## REMAINING: the TV does not render
+## RESOLVED (2026-10-08): use doubletake's sender as is
+
+`airmirror/` (repo root) vendors doubletake's `internal/airplay` and streams ffmpeg's H.264 to the
+Apple TV 3; mirror.py uses it. Session holds, frames stream, TEARDOWN is clean. Differences from
+`airplay_mirror.py` that explain the failure below:
+1. FairPlay ran on a separate HTTP connection (fpcli.exe), RTSP on another. The receiver unwraps
+   `ekey` with the FairPlay state of *its own* connection, so the key was garbage. That is also why
+   `et=32` gave 466 Key Management Error: with `et` the receiver tried to unwrap and failed.
+   doubletake runs pair-setup, pair-verify, fp-setup and SETUP on one connection, `et=32` included.
+2. No transient pair-setup + raw pair-verify before FairPlay.
+3. Video descriptor lacked `shk`/`shiv`, `latencyMs`, `timestampInfo`.
+4. Frame header [40:48] carries the timeline ID (0 for NTP), not width/height floats.
+5. No data-channel heartbeat or `POST /feedback` every 2 s.
+
+## (historical) REMAINING: the TV does not render
 
 The data channel opens, the codec packet (header[4]=0x01, [6]=0x16, avcC payload) and
 AES-128-CTR-encrypted AVCC video frames are written, but nothing appears on the TV.
