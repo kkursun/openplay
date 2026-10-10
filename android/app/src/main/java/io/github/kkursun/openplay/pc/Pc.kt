@@ -32,15 +32,17 @@ data class PcSettings(
     val segment: Double = 0.5,
     val audio: Boolean = true,
     val speaker: String = "",
+    val volume: Int = 100, // percent of the sound sent
     val source: String = "",
 ) {
     fun json(): JSONObject = JSONObject().put("device", device).put("display", display).put("height", height).put("fps", fps)
-        .put("bitrate", bitrate).put("segment", segment).put("audio", audio).put("speaker", speaker).put("source", source)
+        .put("bitrate", bitrate).put("segment", segment).put("audio", audio).put("speaker", speaker).put("volume", volume).put("source", source)
 
     companion object {
         fun from(j: JSONObject) = PcSettings(
             j.optString("device"), j.optInt("display"), j.optInt("height", 1080), j.optInt("fps", 30), j.optInt("bitrate", 6),
-            j.optDouble("segment", 0.5), j.optBoolean("audio", true), j.optString("speaker"), j.optString("source"),
+            j.optDouble("segment", 0.5), j.optBoolean("audio", true), j.optString("speaker"),
+            j.optInt("volume", 100), j.optString("source"),
         )
     }
 }

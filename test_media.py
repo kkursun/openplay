@@ -6,8 +6,10 @@ import subprocess
 import tempfile
 from pathlib import Path
 
-from mirror import (DEFAULTS, FFMPEG, AirPlayTV, CastTV, convert_subtitle, cues_between, episodes, full_playlist,
-                    hevc_codec, language, paired, pairing_code, parse_probe, plan, probe, start_media_ffmpeg)
+import numpy as np
+
+from mirror import (DEFAULTS, FFMPEG, AirPlayTV, CastTV, clean, convert_subtitle, cues_between, episodes, full_playlist,
+                    hevc_codec, language, louder, paired, pairing_code, parse_probe, plan, probe, start_media_ffmpeg)
 
 # The phone app's pairing code: typed loosely, checked exactly.
 code = pairing_code()
@@ -26,6 +28,12 @@ assert re.findall(r"^live(\d+)\.ts$", whole, flags=re.M) == [str(n) for n in ran
 assert full_playlist(GROWING + "#EXT-X-ENDLIST\n", 1513.45) == GROWING + "#EXT-X-ENDLIST\n"  # already finished
 assert full_playlist(GROWING, 0) == GROWING  # length unknown
 assert parse_probe("Input #0, hls, from 'x':\n  Duration: N/A, start: 1.4, bitrate: N/A")["duration"] == 0
+
+# The volume slider: untouched at 100, silent at 0, quieter on a curve between, and kept within 0-100.
+samples = np.array([[0.5, -0.5], [1.0, -1.0]], dtype=np.float32)
+assert louder(samples, 100) is samples and not louder(samples, 0).any()
+assert np.allclose(louder(samples, 50), samples * 0.25) and louder(samples, 50).dtype == np.float32
+assert DEFAULTS["volume"] == 100 and clean({"volume": 150})["volume"] == 100 and clean({"volume": "-5"})["volume"] == 0
 
 # A season pack's episodes in order, without its sample and subtitles; a torrent with no video, its biggest file.
 PACK = [("Show/Show.S01E10.mkv", 900), ("Show/Sample/sample.mkv", 20), ("Show/Show.S01E2.mkv", 800),

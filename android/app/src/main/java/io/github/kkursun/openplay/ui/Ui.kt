@@ -117,17 +117,24 @@ fun <T> Choice(options: List<Pair<T, String>>, selected: T, modifier: Modifier =
 @Composable
 fun Toggle(checked: Boolean, enabled: Boolean = true, onChange: (Boolean) -> Unit) = Switch(checked, onChange, enabled = enabled)
 
-/** The bitrate slider: changes are sent once the thumb is let go. */
+/** A slider with its value beside it: changes are sent once the thumb is let go. */
 @Composable
-fun BitrateSlider(value: Int, onDone: (Int) -> Unit) {
+fun ValueSlider(value: Int, range: IntRange, steps: Int, unit: String, enabled: Boolean = true, onDone: (Int) -> Unit) {
     var dragging by remember { mutableFloatStateOf(-1f) }
     val shown = if (dragging >= 0) dragging else value.toFloat()
     Row(verticalAlignment = Alignment.CenterVertically) {
-        Slider(shown, { dragging = it }, Modifier.width(140.dp), valueRange = 2f..12f, steps = 9,
-            onValueChangeFinished = { onDone(Math.round(dragging)); dragging = -1f })
-        Text("${Math.round(shown)} Mbps", Modifier.width(64.dp), style = MaterialTheme.typography.bodySmall)
+        Slider(shown, { dragging = it }, Modifier.width(140.dp), enabled = enabled, valueRange = range.first.toFloat()..range.last.toFloat(),
+            steps = steps, onValueChangeFinished = { onDone(Math.round(dragging)); dragging = -1f })
+        Text("${Math.round(shown)}$unit", Modifier.width(64.dp), style = MaterialTheme.typography.bodySmall)
     }
 }
+
+@Composable
+fun BitrateSlider(value: Int, onDone: (Int) -> Unit) = ValueSlider(value, 2..12, 9, " Mbps", onDone = onDone)
+
+/** The sound's volume, in steps of 5. */
+@Composable
+fun VolumeSlider(value: Int, enabled: Boolean, onDone: (Int) -> Unit) = ValueSlider(value, 0..100, 19, "%", enabled, onDone)
 
 /** Status like the dashboard's pill: a coloured dot and a word. */
 @Composable

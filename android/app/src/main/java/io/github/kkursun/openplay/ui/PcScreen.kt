@@ -162,6 +162,9 @@ fun PcHome(ui: PcUi, notify: (String) -> Unit) {
         Setting("Capture from", "Default follows the PC's output; switches live") {
             Choice(listOf("" to "Default output") + st.speakers.map { it to it }, f.speaker, enabled = f.audio) { sp -> Pc.set { it.copy(speaker = sp) } }
         }
+        Setting("Volume", "Of what's sent; the TV's own volume still applies. Changes live") {
+            VolumeSlider(f.volume, f.audio) { v -> Pc.set { it.copy(volume = v) } }
+        }
     }
 
     Row(Modifier.fillMaxWidth().padding(bottom = 12.dp), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
@@ -177,9 +180,9 @@ fun PcHome(ui: PcUi, notify: (String) -> Unit) {
         }
     }
     ErrorBox(ui.error.ifEmpty { st.error }) { Pc.dismiss() }
-    // The sound source switches live; everything else needs a restart.
+    // The sound source and volume switch live; everything else needs a restart.
     val r = st.running
-    val changed = job == "mirror" && r != null && f.copy(speaker = r.speaker, source = r.source) != r
+    val changed = job == "mirror" && r != null && f.copy(speaker = r.speaker, volume = r.volume, source = r.source) != r
     val note = if (changed) "Press Restart to apply changes." else st.detail
     if (note.isNotEmpty()) Hint(note, Modifier.fillMaxWidth().padding(bottom = 8.dp))
     Hint("Mirroring lags about 3 s on an Apple TV, more on Cast. Back or Menu on the TV remote also stops it.", Modifier.padding(bottom = 16.dp))
