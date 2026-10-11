@@ -1,4 +1,4 @@
-"""Mirror this PC's screen and sound, or play a video file, URL or torrent, on an Apple TV 3
+"""Mirror this PC's screen and sound, or play a video file, URL (YouTube's too) or torrent, on an Apple TV 3
 (AirPlay 1), a Mac open to AirPlay from anyone on the network, or a Google Cast device such as a
 Xiaomi TV box, from a web dashboard.
 
@@ -41,6 +41,7 @@ import libtorrent as lt
 import pyatv
 import pychromecast
 import soundcard as sc
+import yt_dlp
 import zeroconf
 from pyatv.auth.hap_pairing import NO_CREDENTIALS
 from pyatv.const import Protocol
@@ -266,8 +267,9 @@ def stop_process(proc):
     proc.wait()
 
 
-def start_media_ffmpeg(out, source, info, copy_video, copy_audio, subtitles, tv, s, start=0):
-    """Turn a video into HLS, copying whatever the TV can play as it is, and its subtitle
+def start_media_ffmpeg(out, sources, info, copy_video, copy_audio, subtitles, tv, s, start=0):
+    """Turn a video (sources: its file or URL, and one for its sound if that comes apart) into HLS,
+    copying whatever the TV can play as it is, and its subtitle
     tracks (ffmpeg's numbers for them) into sub0.vtt, sub1.vtt, ...
     From segment start on, if given (the TV skipped ahead): the segments come out as converting from the
     beginning makes them, but with the playlist in seek.m3u8 and subtitles in subN-<start>.vtt, so the
@@ -293,10 +295,11 @@ def start_media_ffmpeg(out, source, info, copy_video, copy_audio, subtitles, tv,
                  # frag_discont: fMP4 timestamps carry on from the offset, rather than starting over at 0
                  *(["-hls_segment_options", "movflags=+frag_discont"] if ext == "m4s" else []),
                  (out / "seek.m3u8").as_posix()]
+    seek = ["-ss", str(start * SEGMENT)] if start else []
     return run_ffmpeg(out, [
-        *(["-ss", str(start * SEGMENT)] if start else []),
-        # V (not v) skips cover art. Only the first audio track.
-        "-i", source, "-map", "0:V:0?", "-map", "0:a:0?", *video, *audio, *at,
+        *(arg for source in sources for arg in (*seek, "-i", source)),
+        # V (not v) skips cover art. Only the first audio track, of the last input.
+        "-map", "0:V:0?", "-map", f"{len(sources) - 1}:a:0?", *video, *audio, *at,
         # EVENT: segments are only added, so the TV can seek to anything converted so far.
         "-f", "hls", "-hls_time", str(SEGMENT), "-hls_segment_type", tv.segments,
         "-hls_playlist_type", "event", "-hls_flags", "temp_file", *names,
@@ -420,11 +423,35 @@ def subtitle_part(out, name, segments, total):
             + "\n\n".join(dict.fromkeys(filter(None, cues))))
 
 
-async def probe(source):
-    """Container and codecs of a video, from what ffmpeg prints about its input
+def page_video(url, tv):
+    """([video URL, sound URL if apart], title) of the video on a page yt-dlp knows, such as a YouTube video's,
+    in the formats the TV plays as they are where there are any. None for other URLs, which may be videos."""
+    if not any(ie.suitable(url) for ie in yt_dlp.extractor.gen_extractor_classes() if ie.ie_key() != "Generic"):
+        return None
+    fits = f"[vcodec^=avc1][height<=?{tv.max_height}][fps<=?{tv.max_fps}]"
+    # ponytail: H.264 only, which YouTube stops at 1080p; Cast devices could take VP9 up to 4K
+    opts = {"quiet": True, "no_warnings": True, "noplaylist": True, "playlist_items": "1",
+            "js_runtimes": {"deno": {}, "node": {}},  # YouTube's links need its JavaScript run
+            "format": f"bv{fits}+ba[acodec^=mp4a]/b{fits}/bv*+ba/b"}  # live streams only come muxed
+    try:
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+    except yt_dlp.utils.DownloadError as e:
+        # Without its colored "ERROR:" and its tips, which are for its command line.
+        problem = re.sub(r"^\S*ERROR:\S* |\s*Use --.*", "", str(e), flags=re.S)
+        if "not a bot" in problem:
+            problem += " YouTube asks that of VPN and data center connections: try without the VPN."
+        raise RuntimeError(problem) from None
+    info = info["entries"][0] if "entries" in info else info  # a playlist: its first video
+    # ponytail: no http_headers passed on; YouTube doesn't need them, some other sites' links may
+    return [f["url"] for f in info.get("requested_formats") or [info]], info.get("title", "")
+
+
+async def probe(*sources):
+    """Container and codecs of a video, from what ffmpeg prints about its inputs
     (the Windows ffmpeg build this uses comes without ffprobe)."""
     proc = await asyncio.create_subprocess_exec(
-        FFMPEG, "-hide_banner", "-nostdin", "-i", source,
+        FFMPEG, "-hide_banner", "-nostdin", *(arg for source in sources for arg in ("-i", source)),
         stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
     try:
         _, err = await proc.communicate()
@@ -445,7 +472,7 @@ def parse_probe(text):
     # Lines look like "Stream #0:0[0x1](und): Video: h264 (High) (avc1 / 0x31637661), yuv420p(progressive),
     # 1920x1080 [SAR 1:1 DAR 16:9], 23.98 fps, ..." or "Stream #0:1(eng): Audio: ac3, 48000 Hz, 5.1(side), ..."
     # or "Stream #0:2(tur): Subtitle: subrip (srt) (forced)"
-    for lang, kind, codec, rest in re.findall(r"Stream #0:\d+(?:\[\w+\])?(?:\((\w+)\))?: (Video|Audio|Subtitle): (\w+)(.*)", text):
+    for lang, kind, codec, rest in re.findall(r"Stream #\d+:\d+(?:\[\w+\])?(?:\((\w+)\))?: (Video|Audio|Subtitle): (\w+)(.*)", text):
         if kind == "Subtitle":
             info["subtitles"].append((lang, codec, "(forced)" in rest))
         elif kind == "Audio":
@@ -865,6 +892,7 @@ class Mirror:
         self.converting_from = 0  # the segment self.ffmpeg started at
         self.lock = threading.Lock()  # held while seek() swaps self.ffmpeg
         self.file = None  # LocalFile or Torrent served at /media/<token>
+        self.title = ""  # of the web page's video playing
         self.token = ""
         self.tv = None  # the device of the current job
         self.subtitles = []  # {"name", "lang"} of each subtitle rendition, served from subN.vtt
@@ -941,7 +969,7 @@ class Mirror:
             self.status, self.since = "live", time.time()
             if job == "media":
                 self.remember(s["source"], self.file.episode if self.file else 0,
-                              self.file.path.name if self.file else s["source"])
+                              self.file.path.name if self.file else self.title or s["source"])
             same = [n for n, sub in enumerate(self.subtitles) if sub["lang"] and sub["lang"] == s["subtitle"]]
             if same and tv.picks_subtitles:
                 try:
@@ -966,7 +994,7 @@ class Mirror:
             if self.status != "error":
                 self.status = "idle"
             self.client = self.running = self.tv = None
-            self.subtitles, self.subtitle, self.total = [], -1, 0.0
+            self.subtitles, self.subtitle, self.total, self.title = [], -1, 0.0, ""
             if tv:
                 await asyncio.to_thread(tv.close)
             with self.lock:
@@ -1011,6 +1039,7 @@ class Mirror:
 
     async def media(self, s, tv):
         source = s["source"].strip().strip('"')  # Windows' "Copy as path" adds quotes
+        page = None
         if source.startswith("magnet:") or source.lower().split("?")[0].endswith(".torrent"):
             self.file = await asyncio.to_thread(Torrent, source)
             await self.file.ready(s["episode"])
@@ -1020,6 +1049,9 @@ class Mirror:
             self.file = LocalFile(source)
         elif not re.match(r"https?://", source):
             raise RuntimeError("Enter a video file's path, an http(s) URL, a magnet link or a .torrent.")
+        else:
+            page = await asyncio.to_thread(page_video, source, tv)
+        sources, self.title = page or ([source], "")
 
         def problem():
             with self.lock:  # one seek() killed isn't a problem
@@ -1030,7 +1062,7 @@ class Mirror:
         def add_subtitle(name, lang):
             self.subtitles.append({"name": f"{len(self.subtitles) + 1}. {name}".replace('"', "'"), "lang": lang})
 
-        info = await probe(source)
+        info = await probe(*sources)
         # Subtitle tracks inside the video, then subtitle files beside it or in the torrent.
         tracks = [i for i, (_, codec, _) in enumerate(info["subtitles"]) if codec in TEXT_SUBTITLES]
         for i in tracks:
@@ -1047,13 +1079,13 @@ class Mirror:
                 add_subtitle(name if name and len(label) <= 3 else label, code)  # "tr" reads better as Turkish
         copy_video, copy_audio = plan(info, tv)
         # A file is only served as it is if it's MP4, a URL may also be an HLS stream, and subtitles
-        # only travel in this server's HLS.
-        if (copy_video and copy_audio and not self.subtitles
+        # (and sound that comes apart) only travel in this server's HLS.
+        if (copy_video and copy_audio and not self.subtitles and len(sources) == 1
                 and ("mp4" in info["container"] or ("hls" in info["container"] and not self.file))):
             if self.file:
                 return served(tv, f"/media/{self.token}{self.file.path.suffix}"), "video/mp4", False, problem
-            return source, HLS if "hls" in info["container"] else "video/mp4", False, problem
-        self.convert = functools.partial(start_media_ffmpeg, self.out, source, info, copy_video, copy_audio,
+            return sources[0], HLS if "hls" in info["container"] else "video/mp4", False, problem
+        self.convert = functools.partial(start_media_ffmpeg, self.out, sources, info, copy_video, copy_audio,
                                          tracks, tv, s)
         self.ffmpeg = self.convert()
         # ponytail: copied video is cut at the source's own keyframes, so its segments differ in length and

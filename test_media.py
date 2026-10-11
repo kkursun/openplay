@@ -85,12 +85,27 @@ with tempfile.TemporaryDirectory() as tmp:
     for tv, first, segment in ((AirPlayTV, 9.4, "live2.ts"), (CastTV, 8, "both.mp4")):  # MPEG-TS starts at 1.4 s
         out = tmp / tv.segments
         out.mkdir()
-        assert start_media_ffmpeg(out, str(tmp / "long.mkv"), info, False, False, [0], tv, DEFAULTS, 2).wait() == 0
+        assert start_media_ffmpeg(out, [str(tmp / "long.mkv")], info, False, False, [0], tv, DEFAULTS, 2).wait() == 0
         if tv is CastTV:
             (out / segment).write_bytes((out / "init.mp4").read_bytes() + (out / "live2.m4s").read_bytes())
         text = subprocess.run([FFMPEG, "-i", str(out / segment)], capture_output=True, text=True).stderr
         assert abs(float(re.search(r"start: ([\d.]+)", text)[1]) - first) < 0.1, (tv, text)
         assert "Late" in cues_between((out / "sub0-2.vtt").read_text(encoding="utf-8"), 8, 12)
+
+    # A web video's picture and sound in separate files, as YouTube serves them: probed and converted together,
+    # both from where the TV skipped to.
+    subprocess.run([FFMPEG, "-v", "error", "-f", "lavfi", "-i", "testsrc2=size=320x180:duration=12",
+                    "-c:v", "libx264", str(tmp / "picture.mp4")], check=True)
+    subprocess.run([FFMPEG, "-v", "error", "-f", "lavfi", "-i", "sine=duration=12", "-c:a", "aac",
+                    str(tmp / "sound.m4a")], check=True)
+    apart = [str(tmp / "picture.mp4"), str(tmp / "sound.m4a")]
+    info = asyncio.run(probe(*apart))
+    assert (info["video"], info["audio"]) == ("h264", "aac") and plan(info, AirPlayTV) == (True, True), info
+    out = tmp / "apart"
+    out.mkdir()
+    assert start_media_ffmpeg(out, apart, info, True, True, [], AirPlayTV, DEFAULTS, 2).wait() == 0
+    text = subprocess.run([FFMPEG, "-i", str(out / "live2.ts")], capture_output=True, text=True).stderr
+    assert "Video: h264" in text and "Audio: aac" in text, text
 
     (tmp / "junk.mp4").write_text("not a video")
     try:
