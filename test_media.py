@@ -9,7 +9,8 @@ from pathlib import Path
 import numpy as np
 
 from mirror import (DEFAULTS, FFMPEG, AirPlayTV, CastTV, clean, convert_subtitle, cues_between, episodes, full_playlist,
-                    hevc_codec, language, louder, paired, pairing_code, parse_probe, plan, probe, start_media_ffmpeg)
+                    SEGMENT, hevc_codec, language, louder, paired, pairing_code, parse_probe, plan, probe,
+                    start_media_ffmpeg)
 
 # The phone app's pairing code: typed loosely, checked exactly.
 code = pairing_code()
@@ -114,6 +115,22 @@ with tempfile.TemporaryDirectory() as tmp:
     assert start_media_ffmpeg(out, apart, info, True, True, [], AirPlayTV, DEFAULTS, 2).wait() == 0
     text = subprocess.run([FFMPEG, "-i", str(out / "live2.ts")], capture_output=True, text=True).stderr
     assert "Video: h264" in text and "Audio: aac" in text, text
+
+    # Copied video with keyframes 10 s apart is still cut every SEGMENT seconds, so the TV can be shown its whole
+    # length ahead and the listed segments are the ones that come out, from the start or from a seek.
+    sparse = str(tmp / "sparse.mp4")
+    subprocess.run([FFMPEG, "-v", "error", "-f", "lavfi", "-i", "testsrc=size=320x240:rate=25:duration=40",
+                    "-c:v", "libx264", "-g", "250", sparse], check=True)
+    info = asyncio.run(probe(sparse))
+    assert plan(info, AirPlayTV)[0], info
+    for start in (0, 5):
+        out = tmp / f"sparse{start}"
+        out.mkdir()
+        assert start_media_ffmpeg(out, [sparse], info, True, True, [], AirPlayTV, DEFAULTS, start).wait() == 0
+        text = (out / ("seek.m3u8" if start else "live.m3u8")).read_text()
+        names = re.findall(r"^live(\d+)\.ts$", text, flags=re.M)
+        assert names == [str(n) for n in range(start, 10)], text
+        assert all(abs(float(x) - SEGMENT) < 0.2 for x in re.findall(r"EXTINF:([\d.]+)", text)[:-1]), text
 
     # A video's sound at a lower volume is converted (never copied as it is), and comes out quieter by that much.
     # (Stereo: converting mono to stereo, as every converted sound is, takes 3 dB off by itself.)

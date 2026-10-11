@@ -304,7 +304,10 @@ def start_media_ffmpeg(out, sources, info, copy_video, copy_audio, subtitles, tv
         "-map", "0:V:0?", "-map", f"{len(sources) - 1}:a:0?", *video, *audio, *at,
         # EVENT: segments are only added, so the TV can seek to anything converted so far.
         "-f", "hls", "-hls_time", str(SEGMENT), "-hls_segment_type", tv.segments,
-        "-hls_playlist_type", "event", "-hls_flags", "temp_file", *names,
+        # split_by_time: copied video is cut every SEGMENT seconds too, not at the source's own keyframes (which
+        # may be 10 s apart), so full_playlist() can list it ahead. Its segments may then start between
+        # keyframes, which only shows when the TV seeks: the picture waits for the next one.
+        "-hls_playlist_type", "event", "-hls_flags", "temp_file" + ("+split_by_time" if copy_video else ""), *names,
         *extract,
     ])
 
@@ -1103,10 +1106,7 @@ class Mirror:
         self.convert = functools.partial(start_media_ffmpeg, self.out, sources, info, copy_video, copy_audio,
                                          tracks, tv, s)
         self.ffmpeg = self.convert()
-        # ponytail: copied video is cut at the source's own keyframes, so its segments differ in length and
-        # can't be listed ahead: the TV only knows the length converted so far (copying is quick, so that
-        # soon catches up). Re-encoding it would fix that, at a cost in quality and GPU time.
-        self.total = 0.0 if copy_video else info["duration"]
+        self.total = info["duration"]
         await self.hls_ready()
         # Only subtitles need the master playlist. ffmpeg leaves its CODECS out for HEVC, and without them
         # a player may assume H.264.
