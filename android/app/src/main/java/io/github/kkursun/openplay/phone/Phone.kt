@@ -38,19 +38,20 @@ data class PhoneSettings(
     val bitrate: Int = 6, // Mbps
     val segment: Double = 0.5, // seconds per segment of the mirrored screen
     val audio: Boolean = true,
+    val volume: Int = 100, // percent of the sound sent
     val source: String = "",
     val subtitle: String = "", // language last picked on a Cast device, picked again next time
     val episode: Int = 0, // which of a torrent's videos plays, in episodes() order
 ) {
     fun json(): JSONObject = JSONObject().put("device", device).put("height", height).put("fps", fps).put("bitrate", bitrate)
-        .put("segment", segment).put("audio", audio).put("source", source).put("subtitle", subtitle).put("episode", episode)
+        .put("segment", segment).put("audio", audio).put("volume", volume).put("source", source).put("subtitle", subtitle).put("episode", episode)
 
     companion object {
         /** Saved settings, clamped to sane ranges. */
         fun from(j: JSONObject) = PhoneSettings(
             j.optString("device"), j.optInt("height", 1080).coerceIn(360, 1080), j.optInt("fps", 30).coerceIn(10, 30),
             j.optInt("bitrate", 6).coerceIn(1, 20), j.optDouble("segment", 0.5).coerceIn(0.5, 2.0), j.optBoolean("audio", true),
-            j.optString("source"), j.optString("subtitle"), j.optInt("episode", 0).coerceAtLeast(0),
+            j.optInt("volume", 100).coerceIn(0, 100), j.optString("source"), j.optString("subtitle"), j.optInt("episode", 0).coerceAtLeast(0),
         )
     }
 }
@@ -75,6 +76,7 @@ data class PhoneState(
     val downloads: Long = 0,
     val history: List<HistoryItem> = emptyList(),
     val settings: PhoneSettings = PhoneSettings(),
+    val volume: Int? = null, // the volume the video playing was started at, null if it plays at full whatever is set
 )
 
 /** Plays to a TV from the phone itself: mirrors its screen, or sends a video file, URL or torrent. The phone's
@@ -104,6 +106,7 @@ object Phone {
     private var remux: Remuxer? = null
     private var subtitles = emptyList<Subtitle>() // of each subtitle rendition, served from subN.vtt
     private var subtitle = -1 // the one a Cast device is showing, -1 for none
+    private var volume: Int? = null // the video playing's, null if it plays at full whatever is set
     private val server by lazy { StreamServer() }
     private val added = mutableListOf<Torrent>()
     private val downloads get() = context.getExternalFilesDir("downloads") ?: File(context.filesDir, "downloads")
@@ -135,7 +138,7 @@ object Phone {
             file?.episodes ?: emptyList(), file?.episode ?: 0,
             uploads(settings.source, settings.episode).list()?.sorted() ?: emptyList(),
             downloads.walkTopDown().filter { it.isFile }.sumOf { it.length() },
-            history, settings,
+            history, settings, volume,
         )
     }
 
@@ -247,6 +250,7 @@ object Phone {
                 this@Phone.tv = null
                 subtitles = emptyList()
                 subtitle = -1
+                volume = null
                 tv?.let { runCatching { it.close() } }
                 capture?.stop() ?: air?.stop() ?: projection?.stop()
                 capture = null
@@ -265,12 +269,12 @@ object Phone {
         // ponytail: arm64 phones only (the ABI airmirror is built for) and the Apple TV 3; others keep HLS
         val exe = File(context.applicationInfo.nativeLibraryDir, "libairmirror.so")
         if (tv is AirPlayTv && !tv.needsPairing && exe.exists()) {
-            val air = AirMirror(projection, exe, tv.address, s, context.resources.displayMetrics.densityDpi, sound)
+            val air = AirMirror(projection, exe, tv.address, s, context.resources.displayMetrics.densityDpi, sound) { settings.volume }
             this.air = air
             runInterruptible { air.start() }
             return Triple("", "", air::problem)
         }
-        val capture = ScreenCapture(projection, out, s, tv.playlistSeconds, context.resources.displayMetrics.densityDpi, sound)
+        val capture = ScreenCapture(projection, out, s, tv.playlistSeconds, context.resources.displayMetrics.densityDpi, sound) { settings.volume }
         this.capture = capture
         capture.start()
         ready(capture.writer, capture::problem)
@@ -321,7 +325,11 @@ object Phone {
             val (code, language) = language(label)
             subs += Subtitle("${subs.size + 1}. ${if (language.isNotEmpty() && label.length <= 3) language else label}", code) // "tr" reads better as Turkish
         }
-        val (copyVideo, copyAudio, why) = plan(info, tv)
+        val (copyVideo, canCopyAudio, why) = plan(info, tv)
+        // Sound below full volume is converted, which only happens in the app's own HLS: H.264 only.
+        val adjustable = info.audio != null && info.video in setOf(null, "h264")
+        val copyAudio = canCopyAudio && !(adjustable && s.volume < 100)
+        volume = if (adjustable) s.volume else null
         if (!copyVideo) throw IllegalStateException("The phone can't send this one: $why. openplay on a PC converts it (the PC tab).")
         val client = InetAddress.getByName(tv.address)
         // An MP4 the TV plays is sent as it is. Subtitles only travel in the app's own HLS, which carries H.264 only.
@@ -335,7 +343,7 @@ object Phone {
                 "in a file the TV can't open as it is. openplay on a PC converts it (the PC tab).")
         }
         subtitles = subs
-        val remux = Remuxer({ extractor(file, source) }, info, out, copyAudio)
+        val remux = Remuxer({ extractor(file, source) }, info, out, copyAudio, volume ?: 100)
         this.remux = remux
         remux.start()
         val trouble = { remux.failure ?: file?.problem() }

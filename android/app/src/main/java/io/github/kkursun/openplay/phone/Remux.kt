@@ -70,7 +70,7 @@ class AacEncoder(private val rate: Int, bitrate: Int, private val output: (ByteA
 }
 
 /** Decodes sound a TV can't play (AC-3, DTS, MP3...) and encodes it as stereo AAC. */
-class AudioTranscoder(format: MediaFormat, private val output: (ByteArray, Long) -> Unit) {
+class AudioTranscoder(format: MediaFormat, private val volume: Int = 100, private val output: (ByteArray, Long) -> Unit) {
     private val mime = format.getString(MediaFormat.KEY_MIME)!!
     private val decoder = try {
         MediaCodec.createDecoderByType(mime).apply { configure(format, null, null, 0); start() }
@@ -134,13 +134,14 @@ class AudioTranscoder(format: MediaFormat, private val output: (ByteArray, Long)
         }
     }
 
-    /** 16-bit stereo from the decoder's PCM: 5.1 and 7.1 folded down (fronts, centre and surrounds), mono doubled. */
+    /** 16-bit stereo from the decoder's PCM at the volume set: 5.1 and 7.1 folded down (fronts, centre and surrounds), mono doubled. */
     private fun stereo(pcm: ByteBuffer): ByteArray {
         val samples = if (float) pcm.asFloatBuffer().let { b -> FloatArray(b.remaining()).also { b.get(it) } }
         else pcm.asShortBuffer().let { b -> ShortArray(b.remaining()).also { b.get(it) }.map { it / 32768f }.toFloatArray() }
         val frames = samples.size / channels
         val out = ByteBuffer.allocate(frames * 4).order(ByteOrder.LITTLE_ENDIAN)
         val c = 0.7071f
+        val g = gain(volume)
         for (f in 0 until frames) {
             val s = { i: Int -> samples[f * channels + i] }
             var (l, r) = when (channels) {
@@ -149,8 +150,8 @@ class AudioTranscoder(format: MediaFormat, private val output: (ByteArray, Long)
                 // Android's order: FL FR FC LFE BL BR (SL SR)
                 else -> (s(0) + c * s(2) + c * s(4)) / (1 + 2 * c) to (s(1) + c * s(2) + c * s(minOf(5, channels - 1))) / (1 + 2 * c)
             }
-            l = l.coerceIn(-1f, 1f)
-            r = r.coerceIn(-1f, 1f)
+            l = (l * g).coerceIn(-1f, 1f)
+            r = (r * g).coerceIn(-1f, 1f)
             out.putShort((l * 32767).toInt().toShort()).putShort((r * 32767).toInt().toShort())
         }
         return out.array()
@@ -164,7 +165,7 @@ class AudioTranscoder(format: MediaFormat, private val output: (ByteArray, Long)
 
 /** Repackages a video the TV can't take as it is (an MKV, say, or one with subtitles to add) into HLS as it's read,
  * like ffmpeg does on the PC: H.264 copied as it is, sound copied if it's AAC and converted to AAC if not. */
-class Remuxer(private val open: () -> MediaExtractor, private val info: Probe, dir: File, copyAudio: Boolean) {
+class Remuxer(private val open: () -> MediaExtractor, private val info: Probe, dir: File, copyAudio: Boolean, private val volume: Int = 100) {
     private val transcode = info.audio != null && !(copyAudio && info.audio == "aac")
     val writer = HlsWriter(dir, SEGMENT, 0, info.video != null, info.audio != null)
     @Volatile var failure: String? = null
@@ -194,7 +195,7 @@ class Remuxer(private val open: () -> MediaExtractor, private val info: Probe, d
             }
             if (info.audioTrack >= 0) ex.selectTrack(info.audioTrack)
             val asc = if (transcode || info.audioTrack < 0) null else TsMuxer.audioConfig(csd(info.audioFormat, "csd-0"))
-            if (transcode) transcoder = AudioTranscoder(info.audioFormat!!) { frame, pts -> sound.addLast(frame to pts) }
+            if (transcode) transcoder = AudioTranscoder(info.audioFormat!!, volume) { frame, pts -> sound.addLast(frame to pts) }
             if (asc != null && asc.first == 5) writer.audioCodec = "mp4a.40.5"
             val times = DecodeTimes<Frame>()
             val write = { f: Frame, dts: Long ->

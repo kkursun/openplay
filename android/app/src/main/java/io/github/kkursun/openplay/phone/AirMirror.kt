@@ -22,6 +22,7 @@ class AirMirror(
     private val s: PhoneSettings,
     private val dpi: Int,
     private val sound: Boolean, // false without the microphone permission sound capture needs
+    private val volume: () -> Int, // percent, read as the sound goes out so the slider works live
 ) {
     @Volatile private var failure: String? = null
     @Volatile private var running = true
@@ -94,7 +95,7 @@ class AirMirror(
             val buffer = ByteArray(AIR_RATE / 100 * 4) // 10 ms
             while (running) {
                 val n = rec.read(buffer, 0, buffer.size)
-                if (n > 0) send('a', buffer.copyOf(n))
+                if (n > 0) send('a', louder(buffer.copyOf(n), volume()))
             }
         } catch (e: Exception) {
             if (running) failure = "Sound capture stopped: $e"
