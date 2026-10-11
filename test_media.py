@@ -9,8 +9,8 @@ from pathlib import Path
 import numpy as np
 
 from mirror import (DEFAULTS, FFMPEG, AirPlayTV, CastTV, clean, convert_subtitle, cues_between, episodes, full_playlist,
-                    SEGMENT, hevc_codec, language, louder, paired, pairing_code, parse_probe, plan, probe,
-                    start_media_ffmpeg)
+                    SEGMENT, hevc_codec, language, louder, master_playlist, paired, pairing_code, parse_probe, plan,
+                    probe, resume_point, start_media_ffmpeg, video_playlist)
 
 # The phone app's pairing code: typed loosely, checked exactly.
 code = pairing_code()
@@ -29,6 +29,10 @@ assert re.findall(r"^live(\d+)\.ts$", whole, flags=re.M) == [str(n) for n in ran
 assert full_playlist(GROWING + "#EXT-X-ENDLIST\n", 1513.45) == GROWING + "#EXT-X-ENDLIST\n"  # already finished
 assert full_playlist(GROWING, 0) == GROWING  # length unknown
 assert parse_probe("Input #0, hls, from 'x':\n  Duration: N/A, start: 1.4, bitrate: N/A")["duration"] == 0
+
+# Where playing a video again offers to resume: not in its first or last minute.
+assert resume_point(773.6, 3600) == 774 and resume_point(59, 3600) == 0 and resume_point(3541, 3600) == 0
+assert resume_point(773.6, 0) == 0 and resume_point(773.6, float("inf")) == 0  # live streams
 
 # The volume slider: untouched at 100, silent at 0, quieter on a curve between, and kept within 0-100.
 samples = np.array([[0.5, -0.5], [1.0, -1.0]], dtype=np.float32)
@@ -131,6 +135,19 @@ with tempfile.TemporaryDirectory() as tmp:
         names = re.findall(r"^live(\d+)\.ts$", text, flags=re.M)
         assert names == [str(n) for n in range(start, 10)], text
         assert all(abs(float(x) - SEGMENT) < 0.2 for x in re.findall(r"EXTINF:([\d.]+)", text)[:-1]), text
+
+    # Resuming converts from the segment it resumes in, with no live.m3u8: the TV is still shown all of it.
+    for tv, ext in ((AirPlayTV, "ts"), (CastTV, "m4s")):
+        out = tmp / f"resume-{ext}"
+        out.mkdir()
+        assert start_media_ffmpeg(out, [sparse], info, True, True, [], tv, DEFAULTS, 5).wait() == 0
+        assert not (out / "live.m3u8").exists() and (out / f"live5.{ext}").exists()
+        whole = video_playlist(out, info["duration"])
+        assert re.findall(r"^live(\d+)\.(\w+)$", whole, flags=re.M) == [(str(n), ext) for n in range(10)], whole
+        assert "#EXT-X-MEDIA-SEQUENCE:0\n" in whole and "PLAYLIST-TYPE:VOD" in whole and whole.endswith("#EXT-X-ENDLIST\n")
+        assert abs(sum(map(float, re.findall(r"EXTINF:([\d.]+)", whole))) - info["duration"]) < 0.01, whole
+        assert ('#EXT-X-MAP:URI="init.mp4"' in whole) == (ext == "m4s"), whole
+        assert "live.m3u8" in master_playlist(out, [])  # written by the resumed conversion, naming seek.m3u8
 
     # A video's sound at a lower volume is converted (never copied as it is), and comes out quieter by that much.
     # (Stereo: converting mono to stereo, as every converted sound is, takes 3 dB off by itself.)

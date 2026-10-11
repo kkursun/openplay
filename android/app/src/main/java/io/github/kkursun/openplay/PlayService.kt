@@ -60,7 +60,7 @@ class PlayService : Service() {
             }, Handler(mainLooper))
             Phone.start("mirror", projection, intent.getBooleanExtra(SOUND, false))
         } else {
-            Phone.start("media")
+            Phone.start("media", start = intent?.getDoubleExtra(START, 0.0) ?: 0.0)
         }
         if (!watching) {
             watching = true
@@ -101,6 +101,7 @@ class PlayService : Service() {
     companion object {
         private const val MIRROR = "mirror"
         private const val PLAY = "play"
+        private const val START = "start"
         private const val STOP = "stop"
         private const val CODE = "code"
         private const val DATA = "data"
@@ -111,6 +112,8 @@ class PlayService : Service() {
             Intent(context, PlayService::class.java).setAction(MIRROR).putExtra(CODE, code).putExtra(DATA, data).putExtra(SOUND, sound))
 
         /** Plays the video in the phone's settings. */
-        fun play(context: Context) = context.startForegroundService(Intent(context, PlayService::class.java).setAction(PLAY))
+        /** Plays the video in the phone's settings, start seconds in. */
+        fun play(context: Context, start: Double = 0.0) =
+            context.startForegroundService(Intent(context, PlayService::class.java).setAction(PLAY).putExtra(START, start))
     }
 }

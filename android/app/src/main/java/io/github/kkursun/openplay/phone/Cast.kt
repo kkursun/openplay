@@ -98,6 +98,8 @@ class CastTv(override val name: String, override val address: String, private va
     @Volatile private var session: String? = null
     @Volatile private var mediaSession = 0
     @Volatile private var playerState = ""
+    @Volatile override var position = 0.0
+    @Volatile override var duration = 0.0
     @Volatile private var idleReason = ""
     @Volatile private var tracks = emptyList<Int>() // ids of the text tracks, in playlist order
     @Volatile private var failed: String? = null
@@ -158,6 +160,8 @@ class CastTv(override val name: String, override val address: String, private va
                 val status = p.optJSONArray("status")?.optJSONObject(0) ?: return
                 mediaSession = status.optInt("mediaSessionId", mediaSession)
                 playerState = status.optString("playerState", playerState)
+                if (status.has("currentTime")) position = status.optDouble("currentTime", position)
+                status.optJSONObject("media")?.optDouble("duration")?.takeIf { it > 0 }?.let { duration = it }
                 idleReason = status.optString("idleReason", "")
                 status.optJSONObject("media")?.optJSONArray("tracks")?.let { t ->
                     tracks = (0 until t.length()).map { t.getJSONObject(it) }.filter { it.optString("type") == "TEXT" }.map { it.getInt("trackId") }
@@ -181,7 +185,7 @@ class CastTv(override val name: String, override val address: String, private va
         }
     }
 
-    override fun play(url: String, contentType: String, live: Boolean) {
+    override fun play(url: String, contentType: String, live: Boolean, start: Double) {
         val tls = SSLContext.getInstance("TLS").apply { init(null, arrayOf(TrustCastDevices), null) }
         val raw = Socket()
         raw.connect(InetSocketAddress(address, port), 10_000)
@@ -208,8 +212,10 @@ class CastTv(override val name: String, override val address: String, private va
         val media = JSONObject().put("contentId", url).put("contentType", contentType)
             .put("streamType", if (live) "LIVE" else "BUFFERED")
         val load = JSONObject().put("type", "LOAD").put("media", media).put("autoplay", true).put("sessionId", session)
-        if (!live) load.put("currentTime", 0) // start growing (EVENT) playlists at the beginning, not the live edge
+        if (!live) load.put("currentTime", start) // start growing (EVENT) playlists at the beginning, not the live edge
         playerState = ""
+        position = start
+        duration = 0.0
         request(t, MEDIA, load)
         await(20, "start playing") { playerState.isNotEmpty() && playerState != "IDLE" || idleReason == "ERROR" }
     }

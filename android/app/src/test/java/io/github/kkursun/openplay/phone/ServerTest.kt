@@ -36,7 +36,9 @@ class ServerTest {
         override val maxFps = 0.0
         override val playlistSeconds = 0.0
         override val picksSubtitles = true
-        override fun play(url: String, contentType: String, live: Boolean) {}
+        override val position = 0.0
+        override val duration = 0.0
+        override fun play(url: String, contentType: String, live: Boolean, start: Double) {}
         override fun alive() = true
         override fun close() {}
     }

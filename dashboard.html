@@ -86,6 +86,13 @@
   .row > button { flex: none; }
   .code { font: 600 16px/1.3 ui-monospace, "Cascadia Mono", Consolas, monospace; letter-spacing: .04em; user-select: all; white-space: nowrap; }
   footer { color: var(--muted); font-size: 12.5px; margin-top: 22px; text-align: center; }
+  dialog {
+    width: min(360px, calc(100% - 32px)); padding: 18px; border: 1px solid var(--border); border-radius: 14px;
+    background: var(--card); color: var(--text);
+  }
+  dialog::backdrop { background: rgb(0 0 0 / .4); }
+  dialog p { margin: 0; font-weight: 500; overflow-wrap: anywhere; }
+  dialog .actions button { font-size: 15px; padding: 10px; }
 </style>
 </head>
 <body>
@@ -214,6 +221,15 @@
   <footer>Mirroring lags about 3 s on a Mac and more on Cast, far less on an Apple TV 3. Back or Menu on the TV remote also stops it.</footer>
 </main>
 
+<dialog id="resume">
+  <p id="resume-text"></p>
+  <span class="hint">Where it was stopped last time</span>
+  <form method="dialog" class="actions">
+    <button value="over">Start over</button>
+    <button value="resume" class="primary" id="resume-at" autofocus></button>
+  </form>
+</dialog>
+
 <script>
 const $ = id => document.getElementById(id);
 const FIELDS = ["device", "display", "height", "fps", "bitrate", "segment", "audio", "speaker", "volume", "source"];
@@ -262,8 +278,8 @@ function showTab(tab) {
 }
 
 function clock(sec) {
-  const m = Math.floor(sec / 60), s = sec % 60;
-  return `${m}:${String(s).padStart(2, "0")}`;
+  const h = Math.floor(sec / 3600), m = Math.floor(sec / 60) % 60, s = sec % 60, pad = n => String(n).padStart(2, "0");
+  return h ? `${h}:${pad(m)}:${pad(s)}` : `${m}:${pad(s)}`;
 }
 
 function render(st) {
@@ -325,7 +341,8 @@ function render(st) {
     $("history-list").replaceChildren(...st.history.map(h => {
       const row = document.createElement("div"), name = document.createElement("span"), when = document.createElement("span");
       row.className = "row"; name.className = "item"; when.className = "hint";
-      when.textContent = new Date(h.time * 1000).toLocaleString([], { dateStyle: "medium", timeStyle: "short" });
+      when.textContent = new Date(h.time * 1000).toLocaleString([], { dateStyle: "medium", timeStyle: "short" })
+        + (h.position ? ` · stopped at ${clock(h.position)}` : "");
       name.append(h.name, when);
       row.append(name, button("Play", "", () => { showTab("home"); $("source").value = h.source; play(h.episode); }));
       return row;
@@ -364,8 +381,28 @@ async function act(fn) {
 const start = () => act(() => api("/api/start", form()));
 const stop = () => act(() => api("/api/stop", {}));
 $("subtitle").onchange = () => act(() => api("/api/subtitle", { index: +$("subtitle").value }));
+// Seconds into the video to start at: where it was stopped last time if the choice is to resume, 0 to start
+// over (or when there's nothing to resume), null if the choice was put off (Escape).
+function startAt(source, episode) {
+  const h = state && state.history.find(h => h.source === source && h.episode === episode);
+  if (!h || !h.position) return Promise.resolve(0);
+  const dialog = $("resume");
+  $("resume-text").textContent = h.name;
+  $("resume-at").textContent = `Resume from ${clock(h.position)}`;
+  dialog.returnValue = "";
+  dialog.showModal();
+  return new Promise(done => dialog.addEventListener("close", () =>
+    done({ resume: h.position, over: 0 }[dialog.returnValue] ?? null), { once: true }));
+}
+
 // Without an episode, a torrent plays the one picked last time (the first, for a new video).
-const play = episode => act(() => api("/api/play", episode === undefined ? form() : { ...form(), episode }));
+async function play(episode) {
+  const f = form();
+  const picked = episode ?? (state && f.source === state.settings.source ? state.settings.episode : 0);
+  const start = await startAt(f.source, picked);
+  if (start === null) return;
+  act(() => api("/api/play", { ...f, ...(episode === undefined ? {} : { episode }), start }));
+}
 $("play").onclick = () => play();
 $("episode").onchange = () => play(+$("episode").value);
 for (const tab of ["home", "history", "phone"]) $("tab-" + tab).onclick = () => showTab(tab);

@@ -91,6 +91,44 @@ class ProtocolTest {
         assertNull(tv.alive()) // closed: gone
     }
 
+    /** Resuming: the Apple TV gets skipped to where the video was stopped once it plays, and says where it is. */
+    @Test
+    fun airPlaySkipsToTheStartOnceItPlays() {
+        val server = ServerSocket(0)
+        val lines = mutableListOf<String>()
+        thread(isDaemon = true) {
+            server.accept().use { c ->
+                val input = c.getInputStream().buffered()
+                val out = c.getOutputStream()
+                repeat(4) {
+                    val line = AirPlayTv.readLine(input)!!
+                    var length = 0
+                    while (true) {
+                        val h = AirPlayTv.readLine(input)!!
+                        if (h.isEmpty()) break
+                        if (h.startsWith("Content-Length:")) length = h.substringAfter(':').trim().toInt()
+                    }
+                    input.skip(length.toLong())
+                    synchronized(lines) { lines += line }
+                    val at = if (lines.count { "scrub" in it } > 0) 300 else 0
+                    val reply = if (line.startsWith("GET")) "<plist><dict><key>duration</key><real>600</real><key>position</key><real>$at</real></dict></plist>".toByteArray() else ByteArray(0)
+                    out.write("HTTP/1.1 200 OK\r\nContent-Length: ${reply.size}\r\n\r\n".toByteArray() + reply)
+                    out.flush()
+                }
+                Thread.sleep(200)
+            }
+        }
+        val tv = AirPlayTv("Living room", "127.0.0.1", server.localPort, "AppleTV3,2", needsPairing = false)
+        tv.play("http://10.0.0.2:5000/media/x.mp4", "video/mp4", live = false, start = 300.0)
+        assertEquals(true, tv.alive())
+        assertEquals(true, tv.alive())
+        tv.close()
+        assertEquals(listOf("POST /play HTTP/1.1", "GET /playback-info HTTP/1.1", "POST /scrub?position=300.000 HTTP/1.1",
+            "GET /playback-info HTTP/1.1"), lines)
+        assertEquals(300.0, tv.position, 0.0)
+        assertEquals(600.0, tv.duration, 0.0)
+    }
+
     @Test
     fun httpReplies() {
         val plist = "<plist><dict><key>error</key><string>x</string></dict></plist>"
