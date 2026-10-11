@@ -188,6 +188,13 @@ fun PhoneHome(st: PhoneState, notify: (String) -> Unit) {
         Setting("Send sound", "From apps that allow it to be captured") { Toggle(s.audio, !running) { a -> Phone.update { it.copy(audio = a) } } }
     }
 
+    Section("Sound") {
+        Setting("Volume", "Mirroring changes live; a video takes it from the next Play. The TV's own volume still applies") {
+            VolumeSlider(s.volume) { v -> Phone.update { it.copy(volume = v) } }
+        }
+        Hint("Videos the phone sends as they are, rather than repackaged (HEVC ones), play at full volume.")
+    }
+
     Row(Modifier.fillMaxWidth().padding(bottom = 12.dp), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
         val big = Modifier.weight(1f)
         when (if (running) st.job else null) {
@@ -200,7 +207,10 @@ fun PhoneHome(st: PhoneState, notify: (String) -> Unit) {
         }
     }
     ErrorBox(st.error) { Phone.dismiss() }
-    if (st.detail.isNotEmpty()) Hint(st.detail, Modifier.fillMaxWidth().padding(bottom = 8.dp))
+    // A video is converted as it plays, so a new volume only reaches it when it's played again.
+    val quieter = running && st.job == "media" && st.volume != null && s.volume != st.volume
+    val note = if (quieter) "Press Play to apply the volume. The video starts over." else st.detail
+    if (note.isNotEmpty()) Hint(note, Modifier.fillMaxWidth().padding(bottom = 8.dp))
     Hint("Mirroring lags a few seconds behind the phone. Back or Menu on the TV remote also stops it.", Modifier.padding(bottom = 16.dp))
 }
 

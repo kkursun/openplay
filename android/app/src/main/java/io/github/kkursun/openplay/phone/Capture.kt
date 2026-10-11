@@ -25,6 +25,7 @@ class ScreenCapture(
     playlistSeconds: Double,
     private val dpi: Int,
     private val sound: Boolean, // false without the microphone permission sound capture needs
+    private val volume: () -> Int, // percent, read as the sound goes out so the slider works live
 ) {
     val writer = HlsWriter(dir, s.segment, maxOf(2, ceil(playlistSeconds / s.segment).toInt()), true, sound)
     @Volatile var failure: String? = null
@@ -103,7 +104,7 @@ class ScreenCapture(
                     val n = rec.read(buffer, 0, buffer.size, AudioRecord.READ_NON_BLOCKING)
                     if (n <= 0) break
                     if (written + n / 4 <= due + RATE / 5) { // drop audio >200 ms ahead of the clock
-                        aac.encode(buffer.copyOf(n), begun + written * 1_000_000 / RATE)
+                        aac.encode(louder(buffer.copyOf(n), volume()), begun + written * 1_000_000 / RATE)
                         written += n / 4
                     }
                 }
@@ -184,4 +185,20 @@ fun playbackRecorder(projection: MediaProjection, rate: Int): AudioRecord {
         .setChannelMask(AudioFormat.CHANNEL_IN_STEREO).build()
     return AudioRecord.Builder().setAudioFormat(format).setBufferSizeInBytes(rate * 4)
         .setAudioPlaybackCaptureConfig(config).build()
+}
+
+/** What samples are multiplied by at a volume slider's percent. Squared, as the ear hears loudness on a curve. */
+fun gain(percent: Int): Float = (percent.coerceIn(0, 100) / 100f).let { it * it }
+
+/** 16-bit little-endian samples at a volume slider's percent, changed in place. */
+fun louder(pcm: ByteArray, percent: Int): ByteArray {
+    if (percent >= 100) return pcm
+    val g = gain(percent)
+    for (i in 0 until pcm.size - 1 step 2) {
+        val sample = ((pcm[i + 1].toInt() shl 8) or (pcm[i].toInt() and 0xff)) * g
+        val v = sample.toInt()
+        pcm[i] = v.toByte()
+        pcm[i + 1] = (v shr 8).toByte()
+    }
+    return pcm
 }
