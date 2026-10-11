@@ -100,6 +100,27 @@ with tempfile.TemporaryDirectory() as tmp:
         assert abs(float(re.search(r"start: ([\d.]+)", text)[1]) - first) < 0.1, (tv, text)
         assert "Late" in cues_between((out / "sub0-2.vtt").read_text(encoding="utf-8"), 8, 12)
 
+    # A video's sound at a lower volume is converted (never copied as it is), and comes out quieter by that much.
+    # (Stereo: converting mono to stereo, as every converted sound is, takes 3 dB off by itself.)
+    stereo = str(tmp / "stereo.mp4")
+    subprocess.run([FFMPEG, "-v", "error", *clip, "-ac", "2", "-c:v", "libx264", "-c:a", "aac", stereo], check=True)
+    info = asyncio.run(probe(stereo))
+    assert plan(info, AirPlayTV, 100) == (True, True) and plan(info, AirPlayTV, 50) == (True, False)
+    assert plan({**info, "audio": None}, AirPlayTV, 50) == (True, True)  # nothing to turn down
+
+    def loudest(volume):
+        out = tmp / f"volume{volume}"
+        out.mkdir()
+        copy_video, copy_audio = plan(info, AirPlayTV, volume)
+        s = {**DEFAULTS, "volume": volume}
+        assert start_media_ffmpeg(out, stereo, info, copy_video, copy_audio, [], AirPlayTV, s).wait() == 0
+        text = subprocess.run([FFMPEG, "-i", str(out / "live.m3u8"), "-af", "volumedetect", "-f", "null", "-"],
+                              capture_output=True, text=True).stderr
+        return float(re.search(r"max_volume: (-?[\d.]+) dB", text)[1])
+    full, half, none = loudest(100), loudest(50), loudest(0)
+    assert abs(full - half - 12) < 1.5, (full, half)  # a quarter of the amplitude: -12 dB
+    assert none < -60, none  # silent
+
     (tmp / "junk.mp4").write_text("not a video")
     try:
         asyncio.run(probe(str(tmp / "junk.mp4")))

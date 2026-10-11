@@ -202,7 +202,7 @@
       <select id="speaker"></select>
     </div>
     <div class="row">
-      <label for="volume">Volume<span class="hint">Of what's sent; the TV's own volume still applies. Changes live</span></label>
+      <label for="volume">Volume<span class="hint">Mirroring changes live; a video takes it from the next Play. The TV's own volume still applies</span></label>
       <span class="range"><input type="range" id="volume" min="0" max="100" step="5"><output id="volume-out"></output></span>
     </div>
   </section>
@@ -243,7 +243,7 @@ function fill(s) {
   }
   $("bitrate-out").textContent = $("bitrate").value + " Mbps";
   $("volume-out").textContent = $("volume").value + "%";
-  $("speaker").disabled = $("volume").disabled = !$("audio").checked;
+  $("speaker").disabled = !$("audio").checked;
 }
 
 function setOptions(sel, items, current) {
@@ -337,7 +337,10 @@ function render(st) {
   $("remote-url").textContent = st.remote.url;
   // The sound source and volume switch live; everything else needs a restart.
   const changed = job === "mirror" && FIELDS.some(k => !["speaker", "volume", "source"].includes(k) && form()[k] != st.running[k]);
-  $("note").textContent = changed ? "Press Restart to apply changes." : st.detail;
+  // A video is converted ahead of the TV, so a new volume only reaches it when it's played again.
+  const quieter = job === "media" && +$("volume").value !== st.running.volume;
+  $("note").textContent = changed ? "Press Restart to apply changes."
+    : quieter ? "Press Play to apply the volume. The video starts over." : st.detail;
   $("error").style.display = st.error ? "block" : "none";
   $("error").textContent = st.error;
 }

@@ -282,7 +282,8 @@ def start_media_ffmpeg(out, source, info, copy_video, copy_audio, subtitles, tv,
         # A keyframe every SEGMENT seconds on the dot, so every segment is that long and full_playlist() can
         # list them ahead. (GOPs alone drift: segments of 2 or 3 GOPs turn up as they slip off the grid.)
         "-force_key_frames", f"expr:gte(t,n_forced*{SEGMENT})"]
-    audio = ["-c:a", "copy"] if copy_audio else ["-c:a", "aac", "-b:a", "192k", "-ac", "2"]
+    quieter = ["-af", f"volume={gain(s['volume']):.4f}"] if s["volume"] < 100 else []
+    audio = ["-c:a", "copy"] if copy_audio else ["-c:a", "aac", "-b:a", "192k", "-ac", "2", *quieter]
     # Written as ffmpeg reads along, so subtitles of a torrent still downloading keep coming.
     extract = [arg for n, i in enumerate(subtitles)
                for arg in ("-map", f"0:s:{i}", "-c:s", "webvtt", "-flush_packets", "1", *at,
@@ -458,12 +459,12 @@ def parse_probe(text):
     return info
 
 
-def plan(info, tv):
-    """Whether the TV can play the video's picture and sound as they are."""
+def plan(info, tv, volume=100):
+    """Whether the TV can play the video's picture and sound as they are. Sound below full volume can't be."""
     v = info["video"]
     copy_video = v is None or (v in tv.video and info["height"] <= tv.max_height and info["fps"] <= tv.max_fps
                                and not (v == "h264" and info["ten_bit"]))  # no TV decodes 10-bit H.264
-    return copy_video, info["audio"] in (None, *tv.audio)
+    return copy_video, info["audio"] is None or (info["audio"] in tv.audio and volume == 100)
 
 
 def capture_audio(ffmpeg, wanted, chunks, rate):
@@ -488,10 +489,14 @@ def capture_audio(ffmpeg, wanted, chunks, rate):
                     chunks.put(rec.record(numframes=None))
 
 
+def gain(percent):
+    """What samples are multiplied by at a volume slider's percent. Squared, as the ear hears loudness on a curve."""
+    return (percent / 100) ** 2
+
+
 def louder(data, percent):
-    """The samples at a volume slider's percent. Squared, as the ear hears loudness on a curve."""
-    gain = (percent / 100) ** 2
-    return data if gain == 1 else data * gain
+    """The samples at a volume slider's percent."""
+    return data if percent >= 100 else data * gain(percent)
 
 
 def pump_audio(ffmpeg, wanted, volume, rate=RATE, pcm16=False):
@@ -1055,7 +1060,7 @@ class Mirror:
                 label = label.strip(" ._-") or "Subtitles"
                 code, name = language(label)
                 add_subtitle(name if name and len(label) <= 3 else label, code)  # "tr" reads better as Turkish
-        copy_video, copy_audio = plan(info, tv)
+        copy_video, copy_audio = plan(info, tv, s["volume"])
         # A file is only served as it is if it's MP4, a URL may also be an HLS stream, and subtitles
         # only travel in this server's HLS.
         if (copy_video and copy_audio and not self.subtitles
