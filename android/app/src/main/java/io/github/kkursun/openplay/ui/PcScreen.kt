@@ -162,6 +162,9 @@ fun PcHome(ui: PcUi, notify: (String) -> Unit) {
         Setting("Capture from", "Default follows the PC's output; switches live") {
             Choice(listOf("" to "Default output") + st.speakers.map { it to it }, f.speaker, enabled = f.audio) { sp -> Pc.set { it.copy(speaker = sp) } }
         }
+        Setting("Volume", "Mirroring changes live; a video takes it from the next Play. The TV's own volume still applies") {
+            VolumeSlider(f.volume) { v -> Pc.set { it.copy(volume = v) } }
+        }
     }
 
     Row(Modifier.fillMaxWidth().padding(bottom = 12.dp), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
@@ -177,10 +180,12 @@ fun PcHome(ui: PcUi, notify: (String) -> Unit) {
         }
     }
     ErrorBox(ui.error.ifEmpty { st.error }) { Pc.dismiss() }
-    // The sound source switches live; everything else needs a restart.
+    // The sound source and volume switch live; everything else needs a restart.
     val r = st.running
-    val changed = job == "mirror" && r != null && f.copy(speaker = r.speaker, source = r.source) != r
-    val note = if (changed) "Press Restart to apply changes." else st.detail
+    val changed = job == "mirror" && r != null && f.copy(speaker = r.speaker, volume = r.volume, source = r.source) != r
+    // A video is converted ahead of the TV, so a new volume only reaches it when it's played again.
+    val quieter = job == "media" && r != null && f.volume != r.volume
+    val note = if (changed) "Press Restart to apply changes." else if (quieter) "Press Play to apply the volume. The video starts over." else st.detail
     if (note.isNotEmpty()) Hint(note, Modifier.fillMaxWidth().padding(bottom = 8.dp))
     Hint("Mirroring lags about 3 s on an Apple TV, more on Cast. Back or Menu on the TV remote also stops it.", Modifier.padding(bottom = 16.dp))
 

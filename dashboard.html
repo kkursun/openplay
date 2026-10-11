@@ -201,6 +201,10 @@
       <label for="speaker">Capture from<span class="hint">Default follows your PC's output; switches live</span></label>
       <select id="speaker"></select>
     </div>
+    <div class="row">
+      <label for="volume">Volume<span class="hint">Mirroring changes live; a video takes it from the next Play. The TV's own volume still applies</span></label>
+      <span class="range"><input type="range" id="volume" min="0" max="100" step="5"><output id="volume-out"></output></span>
+    </div>
   </section>
 
   <div class="actions" id="actions"></div>
@@ -212,7 +216,7 @@
 
 <script>
 const $ = id => document.getElementById(id);
-const FIELDS = ["device", "display", "height", "fps", "bitrate", "segment", "audio", "speaker", "source"];
+const FIELDS = ["device", "display", "height", "fps", "bitrate", "segment", "audio", "speaker", "volume", "source"];
 let state = null, filled = false, busy = false, listsKey = "", subsKey = "", episodesKey = "", historyKey = "";
 
 async function api(path, body) {
@@ -228,7 +232,7 @@ function form() {
   return {
     device: $("device").value, display: +$("display").value, height: +$("height").value,
     fps: +$("fps").value, bitrate: +$("bitrate").value, segment: +$("segment").value,
-    audio: $("audio").checked, speaker: $("speaker").value, source: $("source").value,
+    audio: $("audio").checked, speaker: $("speaker").value, volume: +$("volume").value, source: $("source").value,
   };
 }
 
@@ -238,6 +242,7 @@ function fill(s) {
     if (el.type === "checkbox") el.checked = s[k]; else el.value = String(s[k]);
   }
   $("bitrate-out").textContent = $("bitrate").value + " Mbps";
+  $("volume-out").textContent = $("volume").value + "%";
   $("speaker").disabled = !$("audio").checked;
 }
 
@@ -330,9 +335,12 @@ function render(st) {
   for (const b of $("history-list").querySelectorAll("button")) b.disabled = busy;
   $("remote-code").textContent = st.remote.code;
   $("remote-url").textContent = st.remote.url;
-  // The sound source switches live; everything else needs a restart.
-  const changed = job === "mirror" && FIELDS.some(k => k !== "speaker" && k !== "source" && form()[k] != st.running[k]);
-  $("note").textContent = changed ? "Press Restart to apply changes." : st.detail;
+  // The sound source and volume switch live; everything else needs a restart.
+  const changed = job === "mirror" && FIELDS.some(k => !["speaker", "volume", "source"].includes(k) && form()[k] != st.running[k]);
+  // A video is converted ahead of the TV, so a new volume only reaches it when it's played again.
+  const quieter = job === "media" && +$("volume").value !== st.running.volume;
+  $("note").textContent = changed ? "Press Restart to apply changes."
+    : quieter ? "Press Play to apply the volume. The video starts over." : st.detail;
   $("error").style.display = st.error ? "block" : "none";
   $("error").textContent = st.error;
 }
@@ -404,6 +412,7 @@ for (const k of FIELDS) {
   });
 }
 $("bitrate").addEventListener("input", () => { $("bitrate-out").textContent = $("bitrate").value + " Mbps"; });
+$("volume").addEventListener("input", () => { $("volume-out").textContent = $("volume").value + "%"; });
 
 async function poll() {
   try { render(await api("/api/state")); } catch {}

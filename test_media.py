@@ -6,8 +6,10 @@ import subprocess
 import tempfile
 from pathlib import Path
 
-from mirror import (DEFAULTS, FFMPEG, AirPlayTV, CastTV, convert_subtitle, cues_between, episodes, full_playlist,
-                    hevc_codec, language, paired, pairing_code, parse_probe, plan, probe, start_media_ffmpeg)
+import numpy as np
+
+from mirror import (DEFAULTS, FFMPEG, AirPlayTV, CastTV, clean, convert_subtitle, cues_between, episodes, full_playlist,
+                    hevc_codec, language, louder, paired, pairing_code, parse_probe, plan, probe, start_media_ffmpeg)
 
 # The phone app's pairing code: typed loosely, checked exactly.
 code = pairing_code()
@@ -26,6 +28,12 @@ assert re.findall(r"^live(\d+)\.ts$", whole, flags=re.M) == [str(n) for n in ran
 assert full_playlist(GROWING + "#EXT-X-ENDLIST\n", 1513.45) == GROWING + "#EXT-X-ENDLIST\n"  # already finished
 assert full_playlist(GROWING, 0) == GROWING  # length unknown
 assert parse_probe("Input #0, hls, from 'x':\n  Duration: N/A, start: 1.4, bitrate: N/A")["duration"] == 0
+
+# The volume slider: untouched at 100, silent at 0, quieter on a curve between, and kept within 0-100.
+samples = np.array([[0.5, -0.5], [1.0, -1.0]], dtype=np.float32)
+assert louder(samples, 100) is samples and not louder(samples, 0).any()
+assert np.allclose(louder(samples, 50), samples * 0.25) and louder(samples, 50).dtype == np.float32
+assert DEFAULTS["volume"] == 100 and clean({"volume": 150})["volume"] == 100 and clean({"volume": "-5"})["volume"] == 0
 
 # A season pack's episodes in order, without its sample and subtitles; a torrent with no video, its biggest file.
 PACK = [("Show/Show.S01E10.mkv", 900), ("Show/Sample/sample.mkv", 20), ("Show/Show.S01E2.mkv", 800),
@@ -106,6 +114,27 @@ with tempfile.TemporaryDirectory() as tmp:
     assert start_media_ffmpeg(out, apart, info, True, True, [], AirPlayTV, DEFAULTS, 2).wait() == 0
     text = subprocess.run([FFMPEG, "-i", str(out / "live2.ts")], capture_output=True, text=True).stderr
     assert "Video: h264" in text and "Audio: aac" in text, text
+
+    # A video's sound at a lower volume is converted (never copied as it is), and comes out quieter by that much.
+    # (Stereo: converting mono to stereo, as every converted sound is, takes 3 dB off by itself.)
+    stereo = str(tmp / "stereo.mp4")
+    subprocess.run([FFMPEG, "-v", "error", *clip, "-ac", "2", "-c:v", "libx264", "-c:a", "aac", stereo], check=True)
+    info = asyncio.run(probe(stereo))
+    assert plan(info, AirPlayTV, 100) == (True, True) and plan(info, AirPlayTV, 50) == (True, False)
+    assert plan({**info, "audio": None}, AirPlayTV, 50) == (True, True)  # nothing to turn down
+
+    def loudest(volume):
+        out = tmp / f"volume{volume}"
+        out.mkdir()
+        copy_video, copy_audio = plan(info, AirPlayTV, volume)
+        s = {**DEFAULTS, "volume": volume}
+        assert start_media_ffmpeg(out, [stereo], info, copy_video, copy_audio, [], AirPlayTV, s).wait() == 0
+        text = subprocess.run([FFMPEG, "-i", str(out / "live.m3u8"), "-af", "volumedetect", "-f", "null", "-"],
+                              capture_output=True, text=True).stderr
+        return float(re.search(r"max_volume: (-?[\d.]+) dB", text)[1])
+    full, half, none = loudest(100), loudest(50), loudest(0)
+    assert abs(full - half - 12) < 1.5, (full, half)  # a quarter of the amplitude: -12 dB
+    assert none < -60, none  # silent
 
     (tmp / "junk.mp4").write_text("not a video")
     try:

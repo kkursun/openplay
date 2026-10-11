@@ -70,10 +70,11 @@ PORT = 8000
 RATE = 48000
 CHUNK = 1 << 18  # bytes per read when serving a video file
 DEFAULTS = {"device": "", "display": 0, "height": 1080, "fps": 30, "bitrate": 6,
-            "segment": 0.5, "audio": True, "speaker": "", "source": "",
+            "segment": 0.5, "audio": True, "speaker": "", "volume": 100, "source": "",
             "subtitle": "",  # language last picked on a Cast device, picked again next time
             "episode": 0}  # which of a torrent's videos plays, in episodes() order
-LIMITS = {"display": (0, 8), "height": (360, 1080), "fps": (10, 30), "bitrate": (1, 20), "segment": (0.5, 2)}
+LIMITS = {"display": (0, 8), "height": (360, 1080), "fps": (10, 30), "bitrate": (1, 20), "segment": (0.5, 2),
+          "volume": (0, 100)}
 HLS = "application/vnd.apple.mpegurl"
 SEGMENT = 4  # seconds of video in each HLS segment of a converted video
 SKIP = 3  # segments past what's converted a TV may seek to and wait for, before ffmpeg restarts there instead
@@ -283,7 +284,8 @@ def start_media_ffmpeg(out, sources, info, copy_video, copy_audio, subtitles, tv
         # A keyframe every SEGMENT seconds on the dot, so every segment is that long and full_playlist() can
         # list them ahead. (GOPs alone drift: segments of 2 or 3 GOPs turn up as they slip off the grid.)
         "-force_key_frames", f"expr:gte(t,n_forced*{SEGMENT})"]
-    audio = ["-c:a", "copy"] if copy_audio else ["-c:a", "aac", "-b:a", "192k", "-ac", "2"]
+    quieter = ["-af", f"volume={gain(s['volume']):.4f}"] if s["volume"] < 100 else []
+    audio = ["-c:a", "copy"] if copy_audio else ["-c:a", "aac", "-b:a", "192k", "-ac", "2", *quieter]
     # Written as ffmpeg reads along, so subtitles of a torrent still downloading keep coming.
     extract = [arg for n, i in enumerate(subtitles)
                for arg in ("-map", f"0:s:{i}", "-c:s", "webvtt", "-flush_packets", "1", *at,
@@ -484,12 +486,12 @@ def parse_probe(text):
     return info
 
 
-def plan(info, tv):
-    """Whether the TV can play the video's picture and sound as they are."""
+def plan(info, tv, volume=100):
+    """Whether the TV can play the video's picture and sound as they are. Sound below full volume can't be."""
     v = info["video"]
     copy_video = v is None or (v in tv.video and info["height"] <= tv.max_height and info["fps"] <= tv.max_fps
                                and not (v == "h264" and info["ten_bit"]))  # no TV decodes 10-bit H.264
-    return copy_video, info["audio"] in (None, *tv.audio)
+    return copy_video, info["audio"] is None or (info["audio"] in tv.audio and volume == 100)
 
 
 def capture_audio(ffmpeg, wanted, chunks, rate):
@@ -514,13 +516,24 @@ def capture_audio(ffmpeg, wanted, chunks, rate):
                     chunks.put(rec.record(numframes=None))
 
 
-def pump_audio(ffmpeg, wanted, rate=RATE, pcm16=False):
+def gain(percent):
+    """What samples are multiplied by at a volume slider's percent. Squared, as the ear hears loudness on a curve."""
+    return (percent / 100) ** 2
+
+
+def louder(data, percent):
+    """The samples at a volume slider's percent."""
+    return data if percent >= 100 else data * gain(percent)
+
+
+def pump_audio(ffmpeg, wanted, volume, rate=RATE, pcm16=False):
     """Feed audio to ffmpeg (float samples) or airmirror (pcm16) locked to the wall clock, like the
     screen capture.
 
     ffmpeg holds video back until audio for the same moment arrives, so an audio source that
     goes quiet (Linux recorders block while an output delivers nothing) would freeze the stream.
-    Here gaps become silence and anything running ahead of the clock is dropped."""
+    Here gaps become silence and anything running ahead of the clock is dropped.
+    volume() is read for every chunk, so the slider works while streaming."""
     chunks = queue.SimpleQueue()
     threading.Thread(target=capture_audio, args=(ffmpeg, wanted, chunks, rate), daemon=True).start()
     start, written = time.monotonic(), 0
@@ -529,7 +542,7 @@ def pump_audio(ffmpeg, wanted, rate=RATE, pcm16=False):
             time.sleep(0.02)
             due = int((time.monotonic() - start) * rate)
             while not chunks.empty():
-                data = chunks.get()
+                data = louder(chunks.get(), volume())
                 if written + len(data) <= due + rate // 5:  # drop audio >200 ms ahead of the clock
                     ffmpeg.stdin.write((data.clip(-1, 1) * 32767).astype("<i2").tobytes() if pcm16 else data.tobytes())
                     written += len(data)
@@ -1013,7 +1026,8 @@ class Mirror:
         self.ffmpeg = ffmpeg = start_ffmpeg(self.out, s, tv)
         if s["audio"]:
             speaker = lambda: self.settings["speaker"]  # live, so the dashboard can switch it
-            threading.Thread(target=pump_audio, args=(ffmpeg, speaker), daemon=True).start()
+            volume = lambda: self.settings["volume"]
+            threading.Thread(target=pump_audio, args=(ffmpeg, speaker, volume), daemon=True).start()
         await self.hls_ready()
         return served(tv, "/hls/live.m3u8"), HLS, True, lambda: stream_problem(ffmpeg, self.out, s["segment"])
 
@@ -1030,7 +1044,8 @@ class Mirror:
             raise RuntimeError(f"The TV didn't take the mirroring session: {ffmpeg_log(self.out)}")
         if s["audio"]:  # only now: airmirror doesn't read stdin before, and the backlog would lag
             speaker = lambda: self.settings["speaker"]
-            threading.Thread(target=pump_audio, args=(proc, speaker, AIRMIRROR_RATE, True), daemon=True).start()
+            volume = lambda: self.settings["volume"]
+            threading.Thread(target=pump_audio, args=(proc, speaker, volume, AIRMIRROR_RATE, True), daemon=True).start()
 
         def problem():  # exit status 0 is a normal end, such as Menu on the remote
             if proc.poll() not in (None, 0):
@@ -1077,7 +1092,7 @@ class Mirror:
                 label = label.strip(" ._-") or "Subtitles"
                 code, name = language(label)
                 add_subtitle(name if name and len(label) <= 3 else label, code)  # "tr" reads better as Turkish
-        copy_video, copy_audio = plan(info, tv)
+        copy_video, copy_audio = plan(info, tv, s["volume"])
         # A file is only served as it is if it's MP4, a URL may also be an HLS stream, and subtitles
         # (and sound that comes apart) only travel in this server's HLS.
         if (copy_video and copy_audio and not self.subtitles and len(sources) == 1
