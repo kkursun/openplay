@@ -69,6 +69,7 @@ fun PhoneHome(st: PhoneState, notify: (String) -> Unit) {
     val s = st.settings
     val running = st.status == "starting" || st.status == "live"
     var confirm by rememberSaveable { mutableStateOf(false) }
+    val resume = rememberResume()
     if (confirm) {
         AlertDialog(
             onDismissRequest = { confirm = false },
@@ -114,9 +115,12 @@ fun PhoneHome(st: PhoneState, notify: (String) -> Unit) {
         }
     }
     val play = { episode: Int? ->
-        if (episode != null) Phone.update { it.copy(episode = episode) }
-        beforeStart()
-        PlayService.play(context)
+        val e = episode ?: s.episode
+        resume.ask(st.history.firstOrNull { it.source == s.source && it.episode == e }) { start ->
+            if (episode != null) Phone.update(episodeGiven = true) { it.copy(episode = episode) }
+            beforeStart()
+            PlayService.play(context, start)
+        }
     }
     val mirror = {
         beforeStart()
@@ -215,7 +219,7 @@ fun PhoneHome(st: PhoneState, notify: (String) -> Unit) {
 }
 
 @Composable
-fun History(items: List<io.github.kkursun.openplay.phone.HistoryItem>, enabled: Boolean, play: (String, Int) -> Unit) {
+fun History(items: List<io.github.kkursun.openplay.phone.HistoryItem>, enabled: Boolean, play: (io.github.kkursun.openplay.phone.HistoryItem) -> Unit) {
     Section("Recently played") {
         if (items.isEmpty()) Hint("Videos you play show up here.")
         items.forEachIndexed { i, h ->
@@ -223,9 +227,10 @@ fun History(items: List<io.github.kkursun.openplay.phone.HistoryItem>, enabled: 
             Row(Modifier.fillMaxWidth().padding(vertical = 8.dp), verticalAlignment = Alignment.CenterVertically) {
                 Column(Modifier.weight(1f)) {
                     Text(h.name, fontWeight = FontWeight.Medium)
-                    Hint(java.text.DateFormat.getDateTimeInstance(java.text.DateFormat.MEDIUM, java.text.DateFormat.SHORT).format(java.util.Date(h.time * 1000)))
+                    Hint(java.text.DateFormat.getDateTimeInstance(java.text.DateFormat.MEDIUM, java.text.DateFormat.SHORT).format(java.util.Date(h.time * 1000)) +
+                        if (h.position > 0) " · stopped at ${clock(h.position)}" else "")
                 }
-                OutlinedButton(onClick = { play(h.source, h.episode) }, enabled = enabled) { Text("Play") }
+                OutlinedButton(onClick = { play(h) }, enabled = enabled) { Text("Play") }
             }
         }
     }

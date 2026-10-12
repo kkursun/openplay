@@ -6,11 +6,13 @@ import java.io.IOException
 import java.io.InputStream
 import java.net.InetSocketAddress
 import java.net.Socket
+import java.util.Locale
 import java.util.UUID
 
-/** A TV the phone can play to. play() starts playback; alive() says true while playing, false while it looks
- * stopped (TVs also say so while loading, so only a long spell counts), null once it's surely gone; close() stops
- * it. The values list what its player takes. */
+/** A TV the phone can play to. play() starts playback, start seconds in; alive() says true while playing, false
+ * while it looks stopped (TVs also say so while loading, so only a long spell counts), null once it's surely gone,
+ * and keeps position and duration (seconds, 0 when unknown) up to date; close() stops it. The values list what its
+ * player takes. */
 interface Tv {
     val name: String
     val address: String
@@ -22,7 +24,10 @@ interface Tv {
     val playlistSeconds: Double // how much of a live stream its playlist lists
     val picksSubtitles: Boolean // true if the app switches subtitles; false if the TV's own menu does
 
-    fun play(url: String, contentType: String, live: Boolean)
+    val position: Double
+    val duration: Double
+
+    fun play(url: String, contentType: String, live: Boolean, start: Double = 0.0)
     fun alive(): Boolean?
     fun subtitle(index: Int?) {}
     fun close()
@@ -48,8 +53,11 @@ class AirPlayTv(
 
     private var socket: Socket? = null
     private var input: InputStream? = null
+    @Volatile override var position = 0.0
+    @Volatile override var duration = 0.0
+    private var skipTo = 0.0 // once it plays: it takes Start-Position as a fraction of a length it doesn't know yet
 
-    override fun play(url: String, contentType: String, live: Boolean) {
+    override fun play(url: String, contentType: String, live: Boolean, start: Double) {
         if (needsPairing) {
             throw IllegalStateException("$name only takes AirPlay 2 with pairing, which the phone can't do yet. " +
                 "Play it from openplay on a PC instead (the PC tab).")
@@ -60,6 +68,9 @@ class AirPlayTv(
         s.soTimeout = 10_000
         socket = s
         input = BufferedInputStream(s.getInputStream())
+        position = 0.0
+        duration = 0.0
+        skipTo = start
         val body = Plist.write(mapOf("Content-Location" to url, "Start-Position" to 0.0, "X-Apple-Session-ID" to UUID.randomUUID().toString()))
         val (code, _) = request("POST", "/play", body)
         if (code >= 400) throw IllegalStateException("$name refused to play (HTTP $code).")
@@ -74,7 +85,14 @@ class AirPlayTv(
         val map = info as? Map<*, *> ?: return false
         map["error"]?.let { throw IllegalStateException("Apple TV playback error: $it") }
         // The TV leaves out "duration" while loading and during brief rebuffers, not just after Menu is pressed.
-        return "duration" in map
+        if ("duration" !in map) return false
+        position = (map["position"] as? Number)?.toDouble() ?: 0.0
+        duration = (map["duration"] as? Number)?.toDouble() ?: 0.0
+        if (skipTo > 0) {
+            if (position < skipTo - 5) runCatching { request("POST", String.format(Locale.ROOT, "/scrub?position=%.3f", skipTo), null) }
+            skipTo = 0.0
+        }
+        return true
     }
 
     override fun close() {

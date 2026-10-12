@@ -92,6 +92,8 @@ fun PcHome(ui: PcUi, notify: (String) -> Unit) {
     val running = st != null && (st.status == "live" || st.status == "starting")
     val job = if (running) st!!.job else null
     var confirm by rememberSaveable { mutableStateOf(false) }
+    val resume = rememberResume()
+    val play = { episode: Int? -> resume.ask(Pc.played(episode)) { start -> Pc.play(episode, start) } }
     val upload = rememberLauncherForActivityResult(ActivityResultContracts.OpenMultipleDocuments()) { uris ->
         // base64: the PC works out the text encoding
         try {
@@ -122,11 +124,11 @@ fun PcHome(ui: PcUi, notify: (String) -> Unit) {
         OutlinedTextField(f.source, { text -> Pc.edit { it.copy(source = text) } }, Modifier.fillMaxWidth(),
             placeholder = { Text("File path on the PC, URL, magnet link or .torrent") }, singleLine = true,
             keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Uri, imeAction = ImeAction.Go),
-            keyboardActions = KeyboardActions(onGo = { Pc.play() }))
-        Button(onClick = { Pc.play() }, Modifier.fillMaxWidth().padding(top = 8.dp), enabled = !ui.busy && f.source.isNotBlank()) { Text("Play") }
+            keyboardActions = KeyboardActions(onGo = { play(null) }))
+        Button(onClick = { play(null) }, Modifier.fillMaxWidth().padding(top = 8.dp), enabled = !ui.busy && f.source.isNotBlank()) { Text("Play") }
         if (st.episodes.size > 1) {
             HorizontalDivider(Modifier.padding(top = 10.dp))
-            Setting("Episode") { Choice(st.episodes.mapIndexed { i, n -> i to n }, st.episode, enabled = !ui.busy) { Pc.play(it) } }
+            Setting("Episode") { Choice(st.episodes.mapIndexed { i, n -> i to n }, st.episode, enabled = !ui.busy) { play(it) } }
         }
         if (st.subtitles.isNotEmpty()) {
             HorizontalDivider(Modifier.padding(top = 4.dp))

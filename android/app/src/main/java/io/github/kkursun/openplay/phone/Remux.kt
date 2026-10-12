@@ -164,13 +164,20 @@ class AudioTranscoder(format: MediaFormat, private val volume: Int = 100, privat
 }
 
 /** Repackages a video the TV can't take as it is (an MKV, say, or one with subtitles to add) into HLS as it's read,
- * like ffmpeg does on the PC: H.264 copied as it is, sound copied if it's AAC and converted to AAC if not. */
-class Remuxer(private val open: () -> MediaExtractor, private val info: Probe, dir: File, copyAudio: Boolean, private val volume: Int = 100) {
+ * like ffmpeg does on the PC: H.264 copied as it is, sound copied if it's AAC and converted to AAC if not.
+ * Resuming, it starts at the keyframe before start seconds in, with times counted from there. */
+class Remuxer(
+    private val open: () -> MediaExtractor, val info: Probe, dir: File, copyAudio: Boolean,
+    private val volume: Int = 100, private val start: Double = 0.0,
+) {
     private val transcode = info.audio != null && !(copyAudio && info.audio == "aac")
     val writer = HlsWriter(dir, SEGMENT, 0, info.video != null, info.audio != null)
     @Volatile var failure: String? = null
         private set
     @Volatile private var stopped = false
+    /** Seconds into the video the stream starts at: 0, or where resuming started (known before any segment is). */
+    @Volatile var offset = 0.0
+        private set
 
     private class Frame(val data: ByteArray, val pts: Long, val key: Boolean)
 
@@ -193,7 +200,16 @@ class Remuxer(private val open: () -> MediaExtractor, private val info: Probe, d
                 ex.selectTrack(info.videoTrack)
                 writer.muxer.videoConfig(csd(info.videoFormat, "csd-0") + csd(info.videoFormat, "csd-1"))
             }
+            if (start > 0 && info.videoTrack >= 0) {
+                // The keyframe before start, found with the video alone; the sound then starts there too.
+                ex.seekTo((start * 1e6).toLong(), MediaExtractor.SEEK_TO_PREVIOUS_SYNC)
+                offset = maxOf(0L, ex.sampleTime) / 1e6
+            } else if (start > 0) {
+                offset = start
+            }
             if (info.audioTrack >= 0) ex.selectTrack(info.audioTrack)
+            if (offset > 0) ex.seekTo((offset * 1e6).toLong(), MediaExtractor.SEEK_TO_PREVIOUS_SYNC)
+            val shift = (offset * 1e6).toLong()
             val asc = if (transcode || info.audioTrack < 0) null else TsMuxer.audioConfig(csd(info.audioFormat, "csd-0"))
             if (transcode) transcoder = AudioTranscoder(info.audioFormat!!, volume) { frame, pts -> sound.addLast(frame to pts) }
             if (asc != null && asc.first == 5) writer.audioCodec = "mp4a.40.5"
@@ -210,7 +226,7 @@ class Remuxer(private val open: () -> MediaExtractor, private val info: Probe, d
                 if (n < 0) break
                 val data = ByteArray(n)
                 buffer.duplicate().apply { position(0); limit(n) }.get(data)
-                val pts = ex.sampleTime
+                val pts = ex.sampleTime - shift
                 when {
                     track == info.videoTrack -> {
                         val key = ex.sampleFlags and MediaExtractor.SAMPLE_FLAG_SYNC != 0

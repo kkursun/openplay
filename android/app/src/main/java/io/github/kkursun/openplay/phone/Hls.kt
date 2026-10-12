@@ -156,8 +156,9 @@ fun masterPlaylist(subtitles: List<Subtitle>, bandwidth: Int, codecs: String): S
 }
 
 /** subN.m3u8, a subtitle playlist with the same segments as the video's, or subN_M.vtt, subtitle N's cues during
- * video segment M. video is live.m3u8 as it stands, vtt the whole of subtitle N. */
-fun subtitlePart(name: String, video: String, vtt: (Int) -> String): String {
+ * video segment M. video is live.m3u8 as it stands, vtt the whole of subtitle N, offset the seconds into the video
+ * live.m3u8 starts at (resumed partway). */
+fun subtitlePart(name: String, video: String, offset: Double = 0.0, vtt: (Int) -> String): String {
     Regex("sub(\\d+)\\.m3u8").matchEntire(name)?.let { m ->
         return video.replace(Regex("^live(\\d+)\\.\\w+$", RegexOption.MULTILINE)) { "sub${m.groupValues[1]}_${it.groupValues[1]}.vtt" }
     }
@@ -165,7 +166,13 @@ fun subtitlePart(name: String, video: String, vtt: (Int) -> String): String {
     val lengths = Regex("#EXTINF:([\\d.]+)").findAll(video).map { it.groupValues[1].toDouble() }.toList()
     val first = Regex("#EXT-X-MEDIA-SEQUENCE:(\\d+)").find(video)?.groupValues?.get(1)?.toInt() ?: 0
     val index = segment.toInt() - first
-    val start = lengths.take(index).sum()
-    return "WEBVTT\nX-TIMESTAMP-MAP=MPEGTS:$TS_START,LOCAL:00:00:00.000\n\n" +
+    val start = offset + lengths.take(index).sum()
+    // The stream's first moment is offset seconds into the subtitles' time.
+    return "WEBVTT\nX-TIMESTAMP-MAP=MPEGTS:$TS_START,LOCAL:${clock(offset)}\n\n" +
         cuesBetween(vtt(n.toInt()), start, start + lengths[index])
 }
+
+/** Where to offer to resume a video stopped position seconds in: nowhere (0) in its first or last minute, or in a
+ * live stream (of no length, or an endless one). */
+fun resumePoint(position: Double, duration: Double): Long =
+    if (position >= 60 && position < duration - 60 && duration.isFinite()) Math.round(position) else 0

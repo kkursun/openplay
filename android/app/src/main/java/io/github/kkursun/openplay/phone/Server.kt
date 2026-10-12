@@ -21,6 +21,7 @@ class Stream(
     val fileType: String = "video/mp4",
     val subtitles: List<Subtitle> = emptyList(), // served from subN.vtt in dir
     val writer: HlsWriter? = null,
+    val offset: () -> Double = { 0.0 }, // seconds into the video live.m3u8 starts at (resumed partway)
 )
 
 /** Serves the stream to the TV over HTTP, as mirror.py's Handler does on the PC. */
@@ -90,7 +91,7 @@ class StreamServer {
         val body = try {
             when {
                 name == "master.m3u8" -> masterPlaylist(st.subtitles, st.writer?.peakBitrate() ?: 0, st.writer?.codecs() ?: "").toByteArray()
-                name.startsWith("sub") -> subtitlePart(name, File(st.dir, "live.m3u8").readText()) { File(st.dir, "sub$it.vtt").readText() }.toByteArray()
+                name.startsWith("sub") -> subtitlePart(name, File(st.dir, "live.m3u8").readText(), st.offset()) { File(st.dir, "sub$it.vtt").readText() }.toByteArray()
                 else -> File(st.dir, name).readBytes()
             }
         } catch (_: Exception) { // not written yet, or already gone; the player retries

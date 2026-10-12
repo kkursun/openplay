@@ -296,6 +296,8 @@ def start_media_ffmpeg(out, sources, info, copy_video, copy_audio, subtitles, tv
         names = ["-start_number", str(start), "-hls_segment_filename", (out / f"live%d.{ext}").as_posix(),
                  # frag_discont: fMP4 timestamps carry on from the offset, rather than starting over at 0
                  *(["-hls_segment_options", "movflags=+frag_discont"] if ext == "m4s" else []),
+                 # Resuming starts here: no master playlist yet, so this one writes it (naming seek.m3u8).
+                 *(["-master_pl_name", "master.m3u8"] if not (out / "master.m3u8").exists() else []),
                  (out / "seek.m3u8").as_posix()]
     seek = ["-ss", str(start * SEGMENT)] if start else []
     return run_ffmpeg(out, [
@@ -364,7 +366,7 @@ def hevc_codec(init):
 def master_playlist(out, subtitles):
     """ffmpeg's master playlist, with the subtitles added as WebVTT renditions. Apple TVs show the one
     in their own language and offer the rest in their menu; Cast devices switch when told to."""
-    body = (out / "master.m3u8").read_text()
+    body = (out / "master.m3u8").read_text().replace("seek.m3u8", "live.m3u8")  # resumed: see start_media_ffmpeg
     init = (out / "init.mp4").read_bytes() if (out / "init.mp4").exists() else b""
     if "CODECS=" not in body and b"hvcC" in init:  # ffmpeg can't name HEVC; Cast players then assume H.264
         codecs = hevc_codec(init) + (",mp4a.40.2" if b"mp4a" in init else "")
@@ -377,15 +379,16 @@ def master_playlist(out, subtitles):
     return re.sub(r"#EXT-X-STREAM-INF:(.*)", lambda m: f'{media}#EXT-X-STREAM-INF:{m[1]},SUBTITLES="subs"', body)
 
 
-def full_playlist(text, total):
+def full_playlist(text, total, ext=None):
     """ffmpeg's playlist so far (it only lists segments already written) as a finished one covering the
     video's total seconds, with the segments still to come listed too. The TV then shows the real length and
-    can seek anywhere; Handler.hls holds its requests for segments ffmpeg hasn't written yet."""
+    can seek anywhere; Handler.hls holds its requests for segments ffmpeg hasn't written yet.
+    A playlist with no segments yet is listed whole, with segment files of extension ext."""
     names = re.findall(r"^live(\d+)\.(\w+)$", text, flags=re.M)
     left = total - sum(float(x) for x in re.findall(r"#EXTINF:([\d.]+)", text))
-    if "#EXT-X-ENDLIST" in text or not names or left < 1:
+    if "#EXT-X-ENDLIST" in text or not (names or ext) or left < 1:
         return text
-    tail, n, ext = "", int(names[-1][0]), names[-1][1]
+    tail, n, ext = "", int(names[-1][0]) if names else -1, names[-1][1] if names else ext
     while left >= 1:  # a last bit under a second may never be written, and isn't missed
         n, length = n + 1, min(SEGMENT, left)
         tail += f"#EXTINF:{length:.6f},\nlive{n}.{ext}\n"
@@ -393,9 +396,24 @@ def full_playlist(text, total):
     return text.replace("PLAYLIST-TYPE:EVENT", "PLAYLIST-TYPE:VOD") + tail + "#EXT-X-ENDLIST\n"
 
 
+def resume_point(position, duration):
+    """Where to offer to resume a video stopped position seconds in: nowhere (0) in its first or last minute,
+    or in a live stream (of no length, or an endless one)."""
+    return round(position) if 60 <= position < duration - 60 and math.isfinite(duration) else 0
+
+
 def video_playlist(out, total):
-    """live.m3u8 as the TV gets it: whole, if the video's length (total seconds) is known."""
-    text = (out / "live.m3u8").read_text()
+    """live.m3u8 as the TV gets it: whole, if the video's length (total seconds) is known. Converting started
+    midway (to resume) writes no live.m3u8: then all of it is listed ahead, after seek.m3u8's header."""
+    try:
+        text = (out / "live.m3u8").read_text()
+    except FileNotFoundError:
+        if not total:
+            raise
+        seek = (out / "seek.m3u8").read_text()
+        ext = re.findall(r"^live\d+\.(\w+)$", seek, flags=re.M)[0]
+        head = re.sub(r"#EXT-X-MEDIA-SEQUENCE:\d+", "#EXT-X-MEDIA-SEQUENCE:0", seek.split("#EXTINF")[0])
+        return full_playlist(head, total, ext)
     return full_playlist(text, total) if total else text
 
 
@@ -572,9 +590,10 @@ def airplay(conn, method, path, body=None):
         return resp.status, {}
 
 
-# Both kinds of TV: play(url, content_type, live, own_hls) starts playback; alive() says True while
-# playing, False while it looks stopped (TVs also say so while loading, so only a long spell counts),
-# None once it's surely gone; close() stops it. Class attributes list what the player takes.
+# Both kinds of TV: play(url, content_type, live, own_hls, start) starts playback, start seconds in;
+# alive() says True while playing, False while it looks stopped (TVs also say so while loading, so only
+# a long spell counts), None once it's surely gone, and keeps position and duration (seconds, 0 when
+# unknown) up to date; close() stops it. Class attributes list what the player takes.
 
 class AirPlayTV:
     """An AirPlay 1 device like the Apple TV 3, or an AirPlay 2 one (a Mac) that lets anyone on the
@@ -595,11 +614,15 @@ class AirPlayTV:
         self.v2 = self.credentials != NO_CREDENTIALS
         self.loop = asyncio.get_running_loop()  # Mirror's (scan() makes these); pyatv's connections live on it
         self.conn = self.session = self.timing = None
+        self.position = self.duration = self.skip_to = 0.0
 
     def on_loop(self, coro):
         return asyncio.run_coroutine_threadsafe(coro, self.loop).result()
 
-    def play(self, url, *_):  # the TV works out the rest itself
+    def play(self, url, content_type=None, live=False, own_hls=False, start=0.0):  # the TV works out the rest itself
+        # Skipped to once it plays: an Apple TV 3 takes Start-Position as a fraction of a length it doesn't know yet.
+        self.position = self.duration = 0.0
+        self.skip_to = start
         if self.v2:
             code = self.on_loop(self.play_v2(url))
         else:
@@ -638,7 +661,18 @@ class AirPlayTV:
         if "error" in info:
             raise RuntimeError(f"Apple TV playback error: {info['error']}")
         # The TV leaves out "duration" while loading and during brief rebuffers, not just after Menu is pressed.
-        return "duration" in info
+        if "duration" not in info:
+            return False
+        self.position, self.duration = float(info.get("position") or 0), float(info["duration"] or 0)
+        if self.skip_to:
+            if self.position < self.skip_to - 5:  # not already there (EXT-X-START in this server's playlists)
+                path = f"/scrub?position={self.skip_to:.3f}"
+                if self.v2:
+                    self.on_loop(self.conn.post(path))
+                else:
+                    airplay(self.conn, "POST", path)
+            self.skip_to = 0.0
+        return True
 
     async def close_v2(self):
         if self.session:
@@ -672,12 +706,14 @@ class CastTV:
         self.info, self.name, self.address = info, info.friendly_name, info.host
         self.model = info.model_name or "Google Cast"
         self.cast = self.failed = None
+        self.position = self.duration = 0.0
 
-    def play(self, url, content_type, live, own_hls):
+    def play(self, url, content_type, live, own_hls, start=0.0):
         i = self.info
         self.cast = pychromecast.get_chromecast_from_host((i.host, i.port, i.uuid, i.model_name, i.friendly_name))
         self.cast.wait(timeout=10)
         self.failed = None
+        self.position = self.duration = 0.0
 
         def loaded(_, reply):
             if reply and reply.get("type") == "LOAD_FAILED":
@@ -687,7 +723,7 @@ class CastTV:
         media.play_media(
             url, content_type, stream_type="LIVE" if live else "BUFFERED",
             # Start growing (EVENT) playlists at the beginning, not at the live edge.
-            current_time=None if live else 0,
+            current_time=None if live else start,
             # The receiver assumes MPEG-TS segments unless told.
             media_info={"hlsSegmentFormat": "fmp4", "hlsVideoSegmentFormat": "fmp4"} if own_hls else None,
             callback_function=loaded)
@@ -702,7 +738,10 @@ class CastTV:
         status = self.cast.media_controller.status
         if status.idle_reason == "ERROR":
             raise RuntimeError(f"{self.name} hit a playback error.")
-        return app is not None and status.player_state != "IDLE"
+        playing = app is not None and status.player_state != "IDLE"
+        if playing and status.duration:
+            self.position, self.duration = status.adjusted_current_time or 0.0, status.duration
+        return playing
 
     def subtitle(self, index):
         """Show the index-th subtitle rendition, or none."""
@@ -914,6 +953,7 @@ class Mirror:
         self.subtitles = []  # {"name", "lang"} of each subtitle rendition, served from subN.vtt
         self.subtitle = -1  # the one a Cast device is showing, -1 for none
         self.total = 0.0  # seconds of video being converted into equal segments (0: not, or length unknown)
+        self.start_at = 0.0  # seconds into the video it was started at (resumed from)
         self.task = None
         self.loop = asyncio.new_event_loop()
         threading.Thread(target=self.loop.run_forever, daemon=True).start()
@@ -958,9 +998,10 @@ class Mirror:
             pyatv.scan(self.loop, protocol=Protocol.AirPlay, timeout=3), asyncio.to_thread(find_casts, known))
         self.devices = {tv.name: tv for tv in [*map(AirPlayTV, found), *map(CastTV, casts)]}
 
-    async def start(self, job):
+    async def start(self, job, start=0.0):
+        """Mirror, or play the video in the settings start seconds in."""
         await self.stop()
-        self.task = asyncio.create_task(self.run(dict(self.settings), job))
+        self.task = asyncio.create_task(self.run(dict(self.settings), job, start))
 
     async def stop(self):
         if self.task:
@@ -968,11 +1009,12 @@ class Mirror:
             await asyncio.gather(self.task, return_exceptions=True)
             self.task = None
 
-    async def run(self, s, job):
+    async def run(self, s, job, start=0.0):
         self.status, self.error, self.running = "starting", "", {**s, "job": job}
+        self.start_at = start
         self.out = Path(tempfile.mkdtemp())
         self.token = uuid.uuid4().hex
-        tv = None
+        tv, played, episode = None, False, 0
         try:
             tv = self.tv = self.devices.get(s["device"])
             if not tv:
@@ -981,11 +1023,13 @@ class Mirror:
                                                          else self.media(s, tv))
             self.client = tv.address
             if url:  # none when airmirror is already streaming
-                await asyncio.to_thread(tv.play, url, content_type, job == "mirror", own_hls)
-            self.status, self.since = "live", time.time()
+                await asyncio.to_thread(tv.play, url, content_type, job == "mirror", own_hls, self.start_at)
+            self.status, self.since, played = "live", time.time(), job == "media"
+            episode = self.file.episode if self.file else 0
             if job == "media":
-                self.remember(s["source"], self.file.episode if self.file else 0,
-                              self.file.path.name if self.file else self.title or s["source"])
+                self.remember(s["source"], episode, self.file.path.name if self.file else self.title or s["source"],
+                              self.start_at)
+            saved = time.monotonic()
             same = [n for n, sub in enumerate(self.subtitles) if sub["lang"] and sub["lang"] == s["subtitle"]]
             if same and tv.picks_subtitles:
                 try:
@@ -1004,13 +1048,18 @@ class Mirror:
                 if alive is None:
                     break
                 missing = 0 if alive else missing + 1
+                if job == "media" and alive and time.monotonic() - saved > 15:
+                    self.left_off(s["source"], episode, tv.position, tv.duration)
+                    saved = time.monotonic()
         except Exception as e:
             self.status, self.error = "error", str(e) or type(e).__name__
         finally:
+            if played and tv.duration:  # where the TV was last seen playing
+                self.left_off(s["source"], episode, tv.position, tv.duration)
             if self.status != "error":
                 self.status = "idle"
             self.client = self.running = self.tv = None
-            self.subtitles, self.subtitle, self.total, self.title = [], -1, 0.0, ""
+            self.subtitles, self.subtitle, self.total, self.title, self.start_at = [], -1, 0.0, "", 0.0
             if tv:
                 await asyncio.to_thread(tv.close)
             with self.lock:
@@ -1105,8 +1154,11 @@ class Mirror:
             return sources[0], HLS if "hls" in info["container"] else "video/mp4", False, problem
         self.convert = functools.partial(start_media_ffmpeg, self.out, sources, info, copy_video, copy_audio,
                                          tracks, tv, s)
-        self.ffmpeg = self.convert()
         self.total = info["duration"]
+        # Resuming: converting starts at the segment the TV starts in. A stream of unknown length starts over.
+        first = int(self.start_at // SEGMENT) if self.total else 0
+        self.start_at = self.start_at if self.total else 0.0
+        self.ffmpeg, self.converting_from = self.convert(first), first
         await self.hls_ready()
         # Only subtitles need the master playlist. ffmpeg leaves its CODECS out for HEVC, and without them
         # a player may assume H.264.
@@ -1123,11 +1175,19 @@ class Mirror:
         if remember:
             self.update({"subtitle": self.subtitles[index]["lang"] if index >= 0 else ""})
 
-    def remember(self, source, episode, name):
+    def remember(self, source, episode, name, position=0.0):
         """Put a video first in the history, once per source (a torrent keeps its latest episode)."""
-        self.history = [{"source": source, "episode": episode, "name": name, "time": int(time.time())},
+        self.history = [{"source": source, "episode": episode, "name": name, "time": int(time.time()),
+                         "position": round(position)},
                         *(h for h in self.history if h["source"] != source)][:30]
         HISTORY_FILE.write_text(json.dumps(self.history, indent=2))
+
+    def left_off(self, source, episode, position, duration):
+        """Keep where a video playing got to, for playing it again from there."""
+        for h in self.history:
+            if h["source"] == source and h["episode"] == episode:
+                h["position"], h["duration"] = resume_point(position, duration), round(duration)
+                HISTORY_FILE.write_text(json.dumps(self.history, indent=2))
 
     def upload_subtitle(self, name, data):
         """Keep a subtitle file (base64) for the video in the settings, to play with it from then on."""
@@ -1156,7 +1216,7 @@ class Mirror:
         """Let a couple of segments build up (or all of a short video) so the player has something to buffer."""
         while True:
             try:
-                text = (self.out / "live.m3u8").read_text()
+                text = (self.out / ("seek.m3u8" if self.converting_from else "live.m3u8")).read_text()
                 if text.count("#EXTINF") >= 2 or "#EXT-X-ENDLIST" in text:
                     return
             except OSError:  # not written yet
@@ -1253,6 +1313,8 @@ class Handler(BaseHTTPRequestHandler):
                 body = subtitle_part(out, name, M.tv.segments, total).encode()
             elif name == "live.m3u8":
                 body = video_playlist(out, total).encode()
+                if M.start_at:  # resuming: the TV starts there (and an Apple TV gets skipped there too)
+                    body = body.replace(b"#EXTM3U\n", f"#EXTM3U\n#EXT-X-START:TIME-OFFSET={M.start_at:.3f},PRECISE=YES\n".encode(), 1)
             else:
                 body = (out / name).read_bytes()
         except (OSError, IndexError, AttributeError):  # not written yet, or already gone; the player retries
@@ -1313,8 +1375,9 @@ class Handler(BaseHTTPRequestHandler):
             if self.path == "/api/settings":
                 M.update(body)
             elif self.path in ("/api/start", "/api/play"):
+                start = float(body.pop("start", 0) or 0)  # seconds in, to resume
                 M.update(body)
-                M.call(M.start("mirror" if self.path == "/api/start" else "media"))
+                M.call(M.start("mirror" if self.path == "/api/start" else "media", max(0.0, start)))
             elif self.path == "/api/subtitle":
                 M.pick_subtitle(int(body["index"]))
             elif self.path == "/api/upload-subtitle":

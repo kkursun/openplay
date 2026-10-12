@@ -56,7 +56,10 @@ data class PhoneSettings(
     }
 }
 
-data class HistoryItem(val source: String, val episode: Int, val name: String, val time: Long)
+data class HistoryItem(
+    val source: String, val episode: Int, val name: String, val time: Long,
+    val position: Long = 0, // seconds in it was stopped at, 0 if nowhere worth resuming from
+)
 
 data class Device(val name: String, val model: String, val address: String)
 
@@ -119,7 +122,8 @@ object Phone {
         settings = PhoneSettings.from(runCatching { JSONObject(prefs.getString("settings", "{}")!!) }.getOrElse { JSONObject() })
         history = runCatching {
             val a = JSONArray(historyFile.readText())
-            (0 until a.length()).map { a.getJSONObject(it) }.map { HistoryItem(it.getString("source"), it.getInt("episode"), it.getString("name"), it.getLong("time")) }
+            (0 until a.length()).map { a.getJSONObject(it) }
+                .map { HistoryItem(it.getString("source"), it.getInt("episode"), it.getString("name"), it.getLong("time"), it.optLong("position")) }
         }.getOrElse { emptyList() }
         refresh()
         scan()
@@ -176,8 +180,8 @@ object Phone {
         }
     }
 
-    /** Starts mirroring (with a projection) or playing settings.source, stopping whatever ran. */
-    fun start(job: String, projection: MediaProjection? = null, sound: Boolean = false) {
+    /** Starts mirroring (with a projection) or playing settings.source start seconds in, stopping whatever ran. */
+    fun start(job: String, projection: MediaProjection? = null, sound: Boolean = false, start: Double = 0.0) {
         val previous = task
         status = "starting"
         error = ""
@@ -185,7 +189,7 @@ object Phone {
         refresh()
         task = scope.launch {
             previous?.let { stop(it) }
-            run(settings, job, projection, sound)
+            run(settings, job, projection, sound, start)
         }
     }
 
@@ -208,7 +212,7 @@ object Phone {
     /** Whether a job is running (or about to). */
     val busy get() = task?.isActive == true
 
-    private suspend fun run(s: PhoneSettings, job: String, projection: MediaProjection?, sound: Boolean) {
+    private suspend fun run(s: PhoneSettings, job: String, projection: MediaProjection?, sound: Boolean, start: Double) {
         status = "starting"
         error = ""
         this.job = job
@@ -216,14 +220,25 @@ object Phone {
         val token = UUID.randomUUID().toString().replace("-", "")
         val out = File(context.cacheDir, "stream-$token").apply { mkdirs() }
         var tv: Tv? = null
+        var played = false
+        var episode = 0
+        // Where the TV is in the video, and its length: a stream repackaged from partway starts that far in, and
+        // grows as it's repackaged, so the TV only knows its length so far.
+        val position = { (remux?.offset ?: 0.0) + (tv?.position ?: 0.0) }
+        val length = { remux?.info?.duration?.takeIf { it > 0 } ?: tv?.duration ?: 0.0 }
         try {
             tv = devices[s.device] ?: throw IllegalStateException("Pick a TV first (Scan if the list is empty).")
             this.tv = tv
-            val (url, type, problem) = if (job == "mirror") mirror(s, tv, projection!!, sound, out, token) else media(s, tv, out, token)
-            if (url.isNotEmpty()) runInterruptible { tv.play(url, type, job == "mirror") } // none: airmirror plays
+            val (url, type, problem) = if (job == "mirror") mirror(s, tv, projection!!, sound, out, token) else media(s, tv, out, token, start)
+            // The TV starts there itself unless the stream already does.
+            val at = if (remux != null) 0.0 else start
+            if (url.isNotEmpty()) runInterruptible { tv.play(url, type, job == "mirror", at) } // none: airmirror plays
             status = "live"
             since = System.currentTimeMillis()
-            if (job == "media") remember(s.source, file?.episode ?: 0, file?.name ?: s.source.substringAfterLast('/').substringBefore('?'))
+            played = job == "media"
+            episode = file?.episode ?: 0
+            if (job == "media") remember(s.source, episode, file?.name ?: s.source.substringAfterLast('/').substringBefore('?'), start)
+            var saved = System.currentTimeMillis()
             val same = subtitles.indexOfFirst { it.lang.isNotEmpty() && it.lang == s.subtitle }
             if (same >= 0 && tv.picksSubtitles) {
                 runCatching { runInterruptible { pickSubtitle(same, remember = false) } } // a convenience; they can still be picked
@@ -235,6 +250,10 @@ object Phone {
                 problem()?.let { throw IllegalStateException(it) }
                 val alive = (if (url.isEmpty()) air?.alive() else runInterruptible { tv.alive() }) ?: break
                 missing = if (alive) 0 else missing + 1
+                if (played && alive && System.currentTimeMillis() - saved > 15_000) {
+                    leftOff(s.source, episode, position(), length())
+                    saved = System.currentTimeMillis()
+                }
                 refresh()
             }
         } catch (e: CancellationException) {
@@ -244,6 +263,8 @@ object Phone {
             error = e.message ?: e.toString()
         } finally {
             withContext(NonCancellable) {
+                // Where the TV was last seen playing.
+                if (played && tv!!.duration > 0) leftOff(s.source, episode, position(), length())
                 if (status != "error") status = "idle"
                 server.stream = null
                 this@Phone.job = null
@@ -292,7 +313,7 @@ object Phone {
             ?.use { if (it.moveToFirst()) it.getString(0) else null }
     }.getOrNull() ?: source.substringAfterLast('/')
 
-    private suspend fun media(s: PhoneSettings, tv: Tv, out: File, token: String): Triple<String, String, () -> String?> {
+    private suspend fun media(s: PhoneSettings, tv: Tv, out: File, token: String, start: Double): Triple<String, String, () -> String?> {
         val source = s.source.trim().trim('"')
         val file: Source? = when {
             isTorrent(source) -> Torrent(context, source, downloads).also {
@@ -343,12 +364,12 @@ object Phone {
                 "in a file the TV can't open as it is. openplay on a PC converts it (the PC tab).")
         }
         subtitles = subs
-        val remux = Remuxer({ extractor(file, source) }, info, out, copyAudio, volume ?: 100)
+        val remux = Remuxer({ extractor(file, source) }, info, out, copyAudio, volume ?: 100, start)
         this.remux = remux
         remux.start()
         val trouble = { remux.failure ?: file?.problem() }
         ready(remux.writer, trouble)
-        server.stream = Stream(client, out, token, file, subtitles = subs, writer = remux.writer)
+        server.stream = Stream(client, out, token, file, subtitles = subs, writer = remux.writer, offset = { remux.offset })
         return Triple(server.url(tv, if (subs.isNotEmpty()) "/hls/master.m3u8" else "/hls/live.m3u8"), HLS, trouble)
     }
 
@@ -377,12 +398,21 @@ object Phone {
     }
 
     /** Puts a video first in the history, once per source (a torrent keeps its latest episode). */
-    private fun remember(source: String, episode: Int, name: String) {
-        history = (listOf(HistoryItem(source, episode, name, System.currentTimeMillis() / 1000)) + history.filter { it.source != source }).take(30)
-        historyFile.writeText(JSONArray(history.map {
-            JSONObject().put("source", it.source).put("episode", it.episode).put("name", it.name).put("time", it.time)
-        }).toString())
+    private fun remember(source: String, episode: Int, name: String, position: Double) {
+        history = (listOf(HistoryItem(source, episode, name, System.currentTimeMillis() / 1000, Math.round(position))) +
+            history.filter { it.source != source }).take(30)
+        saveHistory()
     }
+
+    /** Keeps where a video playing got to, for playing it again from there. */
+    private fun leftOff(source: String, episode: Int, position: Double, duration: Double) {
+        history = history.map { if (it.source == source && it.episode == episode) it.copy(position = resumePoint(position, duration)) else it }
+        saveHistory()
+    }
+
+    private fun saveHistory() = historyFile.writeText(JSONArray(history.map {
+        JSONObject().put("source", it.source).put("episode", it.episode).put("name", it.name).put("time", it.time).put("position", it.position)
+    }).toString())
 
     /** Folder of the subtitle files added for a video (each episode of a torrent gets its own). */
     private fun uploads(source: String, episode: Int): File {

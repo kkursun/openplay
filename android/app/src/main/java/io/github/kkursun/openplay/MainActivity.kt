@@ -51,6 +51,7 @@ import androidx.lifecycle.repeatOnLifecycle
 import io.github.kkursun.openplay.pc.Pc
 import io.github.kkursun.openplay.phone.Phone
 import io.github.kkursun.openplay.ui.History
+import io.github.kkursun.openplay.ui.rememberResume
 import io.github.kkursun.openplay.ui.OpenplayTheme
 import io.github.kkursun.openplay.ui.PcHome
 import io.github.kkursun.openplay.ui.PcPairing
@@ -122,6 +123,7 @@ private fun Screen(mode: String, setMode: (String) -> Unit, message: String, cle
     var tab by remember { mutableIntStateOf(0) }
     var now by remember { mutableLongStateOf(System.currentTimeMillis()) }
     val snackbar = remember { SnackbarHostState() }
+    val resume = rememberResume()
     val scope = rememberCoroutineScope()
     val notify = { text: String -> scope.launch { snackbar.showSnackbar(text) }; Unit }
     val lifecycle = LocalLifecycleOwner.current.lifecycle
@@ -174,17 +176,21 @@ private fun Screen(mode: String, setMode: (String) -> Unit, message: String, cle
                 }
                 when {
                     mode == "phone" && tab == 0 -> PhoneHome(phone, notify)
-                    mode == "phone" -> History(phone.history, phone.status != "starting") { source, episode ->
-                        tab = 0
-                        Phone.update(episodeGiven = true) { it.copy(source = source, episode = episode) }
-                        PlayService.play(context)
+                    mode == "phone" -> History(phone.history, phone.status != "starting") { h ->
+                        resume.ask(h) { start ->
+                            tab = 0
+                            Phone.update(episodeGiven = true) { it.copy(source = h.source, episode = h.episode) }
+                            PlayService.play(context, start)
+                        }
                     }
                     !pc.paired -> PcPairing(pc)
                     tab == 0 -> PcHome(pc, notify)
-                    else -> History(pc.state?.history ?: emptyList(), !pc.busy) { source, episode ->
-                        tab = 0
-                        Pc.edit { it.copy(source = source) }
-                        Pc.play(episode)
+                    else -> History(pc.state?.history ?: emptyList(), !pc.busy) { h ->
+                        resume.ask(h) { start ->
+                            tab = 0
+                            Pc.edit { it.copy(source = h.source) }
+                            Pc.play(h.episode, start)
+                        }
                     }
                 }
             }

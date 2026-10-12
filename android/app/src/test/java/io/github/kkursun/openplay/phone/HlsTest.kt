@@ -69,6 +69,19 @@ class HlsTest {
         val second = subtitlePart("sub0_1.vtt", video) { vtt }
         assertTrue(second, second.startsWith("WEBVTT\nX-TIMESTAMP-MAP=MPEGTS:126000,LOCAL:00:00:00.000\n\n"))
         assertTrue("İkinci" in second && "Şimdi" !in second)
+        // Resumed 4 s in: the stream's first segment shows the cues from 4 s on, mapped to its start.
+        val resumed = subtitlePart("sub0_0.vtt", video, 4.0) { vtt }
+        assertTrue(resumed, resumed.startsWith("WEBVTT\nX-TIMESTAMP-MAP=MPEGTS:126000,LOCAL:00:00:04.000\n\n"))
+        assertTrue("İkinci" in resumed && "Şimdi" !in resumed)
+    }
+
+    @Test
+    fun resumesOnlyPastTheFirstAndBeforeTheLastMinute() {
+        assertEquals(774L, resumePoint(773.6, 3600.0))
+        assertEquals(0L, resumePoint(59.0, 3600.0))
+        assertEquals(0L, resumePoint(3541.0, 3600.0))
+        assertEquals(0L, resumePoint(773.6, Double.POSITIVE_INFINITY)) // live streams
+        assertEquals(0L, resumePoint(773.6, 0.0))
     }
 
     @Test

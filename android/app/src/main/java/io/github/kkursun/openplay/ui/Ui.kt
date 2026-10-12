@@ -21,6 +21,7 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.DropdownMenu
@@ -50,6 +51,7 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import io.github.kkursun.openplay.phone.HistoryItem
 import java.util.Locale
 
 val Live = Color(0xFF17A34A)
@@ -160,7 +162,42 @@ fun ErrorBox(text: String, onDismiss: (() -> Unit)? = null) {
     }
 }
 
-fun clock(seconds: Long) = String.format(Locale.ROOT, "%d:%02d", seconds / 60, seconds % 60)
+fun clock(seconds: Long) = if (seconds >= 3600) String.format(Locale.ROOT, "%d:%02d:%02d", seconds / 3600, seconds / 60 % 60, seconds % 60)
+    else String.format(Locale.ROOT, "%d:%02d", seconds / 60, seconds % 60)
+
+/** Asks whether to resume a video where it was stopped last time or start it over, as the PC's dashboard does. */
+class ResumeAsker {
+    var asking by mutableStateOf<HistoryItem?>(null)
+        private set
+    private var go: (Double) -> Unit = {}
+
+    /** Plays (go, with the seconds in to start at) right away if item has nowhere to resume from, else once asked. */
+    fun ask(item: HistoryItem?, go: (Double) -> Unit) {
+        if (item == null || item.position <= 0) return go(0.0)
+        this.go = go
+        asking = item
+    }
+
+    fun answer(start: Double?) {
+        asking = null
+        if (start != null) go(start)
+    }
+}
+
+@Composable
+fun rememberResume(): ResumeAsker {
+    val asker = remember { ResumeAsker() }
+    asker.asking?.let { item ->
+        AlertDialog(
+            onDismissRequest = { asker.answer(null) },
+            confirmButton = { TextButton(onClick = { asker.answer(item.position.toDouble()) }) { Text("Resume from ${clock(item.position)}") } },
+            dismissButton = { TextButton(onClick = { asker.answer(0.0) }) { Text("Start over") } },
+            title = { Text(item.name, maxLines = 3) },
+            text = { Text("Stopped at ${clock(item.position)} last time.") },
+        )
+    }
+    return asker
+}
 
 fun bytes(n: Long) = if (n >= 1e9) String.format(Locale.ROOT, "%.1f GB", n / 1e9) else "${Math.ceil(n / 1e6).toLong()} MB"
 

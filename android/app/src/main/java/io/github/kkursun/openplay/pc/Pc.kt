@@ -66,6 +66,7 @@ data class PcState(
     val job: String?, // "mirror" or "media" while one runs
     val devices: List<Device>,
     val computer: String,
+    val playsEpisode: Int = 0, // the one of a torrent Play plays without one given: the last picked
 ) {
     companion object {
         private fun strings(a: JSONArray?) = (0 until (a?.length() ?: 0)).map { a!!.getString(it) }
@@ -79,12 +80,12 @@ data class PcState(
                 strings(j.optJSONArray("subtitles")), j.optInt("subtitle", -1), strings(j.optJSONArray("episodes")), j.optInt("episode"),
                 strings(j.optJSONArray("uploaded")), j.optLong("downloads"),
                 (0 until history.length()).map { history.getJSONObject(it) }
-                    .map { HistoryItem(it.optString("source"), it.optInt("episode"), it.optString("name"), it.optLong("time")) },
+                    .map { HistoryItem(it.optString("source"), it.optInt("episode"), it.optString("name"), it.optLong("time"), it.optLong("position")) },
                 PcSettings.from(j.optJSONObject("settings") ?: JSONObject()), strings(j.optJSONArray("speakers")),
                 running?.let { PcSettings.from(it) }, running?.optString("job"),
                 (0 until devices.length()).map { devices.getJSONObject(it) }
                     .map { Device(it.optString("name"), it.optString("model"), it.optString("address")) },
-                j.optString("computer"),
+                j.optString("computer"), j.optJSONObject("settings")?.optInt("episode") ?: 0,
             )
         }
     }
@@ -258,7 +259,16 @@ object Pc {
     fun start() = act("/api/start", _ui.value.form.json())
     fun stop() = act("/api/stop")
     // Without an episode, a torrent plays the one picked last time (the first, for a new video).
-    fun play(episode: Int? = null) = act("/api/play", _ui.value.form.json().apply { if (episode != null) put("episode", episode) })
+    fun play(episode: Int? = null, start: Double = 0.0) =
+        act("/api/play", _ui.value.form.json().put("start", start).apply { if (episode != null) put("episode", episode) })
+
+    /** The history's entry for the video in the form (and episode, or the one Play plays), to offer resuming. */
+    fun played(episode: Int? = null): HistoryItem? {
+        val ui = _ui.value
+        val st = ui.state ?: return null
+        val e = episode ?: if (ui.form.source == st.settings.source) st.playsEpisode else 0
+        return st.history.firstOrNull { it.source == ui.form.source && it.episode == e }
+    }
     fun subtitle(index: Int) = act("/api/subtitle", JSONObject().put("index", index))
     fun upload(name: String, base64: String) = act("/api/upload-subtitle", _ui.value.form.json().put("name", name).put("data", base64))
     fun clearSubtitles() = act("/api/clear-subtitles", _ui.value.form.json())
