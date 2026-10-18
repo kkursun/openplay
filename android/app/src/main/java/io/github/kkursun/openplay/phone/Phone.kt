@@ -346,25 +346,26 @@ object Phone {
             val (code, language) = language(label)
             subs += Subtitle("${subs.size + 1}. ${if (language.isNotEmpty() && label.length <= 3) language else label}", code) // "tr" reads better as Turkish
         }
-        val (copyVideo, canCopyAudio, why) = plan(info, tv)
-        // Sound below full volume is converted, which only happens in the app's own HLS: H.264 only.
-        val adjustable = info.audio != null && info.video in setOf(null, "h264")
+        val (copyVideo, canCopyAudio, why, convertVideo) = plan(info, tv)
+        // Sound below full volume is converted, which only happens in the app's own HLS: H.264 only (as it is or
+        // converted from HEVC).
+        val adjustable = info.audio != null && (info.video in setOf(null, "h264") || convertVideo)
         val copyAudio = canCopyAudio && !(adjustable && s.volume < 100)
         volume = if (adjustable) s.volume else null
-        if (!copyVideo) throw IllegalStateException("The phone can't send this one: $why. openplay on a PC converts it (the PC tab).")
+        if (!copyVideo && !convertVideo) throw IllegalStateException("The phone can't send this one: $why. openplay on a PC converts it (the PC tab).")
         val client = InetAddress.getByName(tv.address)
         // An MP4 the TV plays is sent as it is. Subtitles only travel in the app's own HLS, which carries H.264 only.
-        if (copyAudio && info.mp4 && (subs.isEmpty() || info.video !in setOf(null, "h264"))) {
+        if (copyVideo && copyAudio && info.mp4 && (subs.isEmpty() || info.video !in setOf(null, "h264"))) {
             if (file == null) return Triple(source, "video/mp4", problem)
             server.stream = Stream(client, out, token, file, "video/mp4")
             return Triple(server.url(tv, "/media/$token.mp4"), "video/mp4", problem)
         }
-        if (info.video != null && info.video != "h264") {
+        if (!convertVideo && info.video != null && info.video != "h264") {
             throw IllegalStateException("The phone only repackages H.264 video, and this is ${info.video.uppercase(Locale.ROOT)} " +
                 "in a file the TV can't open as it is. openplay on a PC converts it (the PC tab).")
         }
         subtitles = subs
-        val remux = Remuxer({ extractor(file, source) }, info, out, copyAudio, volume ?: 100, start)
+        val remux = Remuxer({ extractor(file, source) }, info, out, copyAudio, volume ?: 100, start, if (convertVideo) tv else null)
         this.remux = remux
         remux.start()
         val trouble = { remux.failure ?: file?.problem() }

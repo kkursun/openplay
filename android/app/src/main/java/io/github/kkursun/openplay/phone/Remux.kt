@@ -1,13 +1,23 @@
 package io.github.kkursun.openplay.phone
 
+import android.graphics.SurfaceTexture
 import android.media.AudioFormat
 import android.media.MediaCodec
 import android.media.MediaCodecInfo
 import android.media.MediaExtractor
 import android.media.MediaFormat
+import android.opengl.EGL14
+import android.opengl.EGLExt
+import android.opengl.GLES11Ext
+import android.opengl.GLES20
+import android.os.Build
+import android.os.Handler
+import android.os.HandlerThread
+import android.view.Surface
 import java.io.File
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
+import kotlin.math.roundToInt
 
 /** Stereo 16-bit PCM in, ADTS frames of AAC-LC out, through output(frame, pts µs). */
 class AacEncoder(private val rate: Int, bitrate: Int, private val output: (ByteArray, Long) -> Unit) {
@@ -163,12 +173,306 @@ class AudioTranscoder(format: MediaFormat, private val volume: Int = 100, privat
     }
 }
 
+/** Converts video a TV can't play (HEVC, for the Apple TV 3) to H.264 with the phone's own decoder and encoder: each
+ * decoded picture is drawn, through OpenGL, onto the encoder's input surface, scaled down to fit maxHeight (and 1920
+ * wide) and with frames dropped to keep within maxFps. config gets the SPS and PPS, output the H.264 access units
+ * (pts µs, keyframe) in decode order. */
+class VideoTranscoder(
+    format: MediaFormat, maxHeight: Int, private val maxFps: Double,
+    private val config: (ByteArray) -> Unit, private val output: (ByteArray, Long, Boolean) -> Unit,
+) {
+    private val mime = format.getString(MediaFormat.KEY_MIME)!!
+    private val drawer: FrameDrawer
+    private val encoder: MediaCodec
+    private lateinit var decoder: MediaCodec
+    private val decoded = MediaCodec.BufferInfo()
+    private val encoded = MediaCodec.BufferInfo()
+    private var next = Long.MIN_VALUE // the earliest a frame can be and still be kept, µs
+
+    init {
+        // Pictures the decoder rotates (phone recordings held upright) come out the other way round.
+        val turned = format.getInteger(MediaFormat.KEY_ROTATION, 0) % 180 != 0
+        val w = format.getInteger(if (turned) MediaFormat.KEY_HEIGHT else MediaFormat.KEY_WIDTH)
+        val h = format.getInteger(if (turned) MediaFormat.KEY_WIDTH else MediaFormat.KEY_HEIGHT)
+        val scale = minOf(1.0, 1920.0 / w, maxHeight.toDouble() / h)
+        val width = (w * scale / 2).roundToInt() * 2 // encoders want even sizes
+        val height = (h * scale / 2).roundToInt() * 2
+        val bitrate = (width * height * maxFps * 0.14).toInt().coerceIn(2_000_000, 10_000_000) // ~8.7 Mbps at 1080p30
+        encoder = h264Encoder(width, height, maxFps, bitrate, strict = true) ?: h264Encoder(width, height, maxFps, bitrate, strict = false)
+            ?: throw IllegalStateException("This phone's video encoder won't take ${width}x$height to convert the video. openplay on a PC can.")
+        try {
+            drawer = FrameDrawer(encoder.createInputSurface(), width, height)
+        } catch (e: Exception) {
+            encoder.release()
+            throw e
+        }
+        encoder.start()
+        decoder = try {
+            openDecoder(format, hdrToSdr = true) ?: openDecoder(format, hdrToSdr = false)!!
+        } catch (e: Exception) {
+            release()
+            throw IllegalStateException("This phone can't decode the video's ${mime.substringAfter('/').uppercase()} picture to convert it. openplay on a PC can.")
+        }
+    }
+
+    /** A decoder drawing onto the drawer's surface. HDR video is asked to come out as SDR (Android 12 on, if the
+     * decoder can), as the Apple TV 3 shows nothing else; null if the decoder refuses that. */
+    private fun openDecoder(format: MediaFormat, hdrToSdr: Boolean): MediaCodec? {
+        val f = MediaFormat(format)
+        if (hdrToSdr) {
+            val hdr = f.getInteger(MediaFormat.KEY_COLOR_TRANSFER, 0) in setOf(MediaFormat.COLOR_TRANSFER_ST2084, MediaFormat.COLOR_TRANSFER_HLG)
+            if (!hdr || Build.VERSION.SDK_INT < Build.VERSION_CODES.S) return null
+            f.setInteger(MediaFormat.KEY_COLOR_TRANSFER_REQUEST, MediaFormat.COLOR_TRANSFER_SDR_VIDEO)
+        }
+        val codec = MediaCodec.createDecoderByType(mime)
+        try {
+            codec.configure(f, drawer.surface, null, 0)
+            codec.start()
+            return codec
+        } catch (e: Exception) {
+            codec.release()
+            if (hdrToSdr) return null
+            throw e
+        }
+    }
+
+    fun feed(data: ByteArray, pts: Long) {
+        while (true) {
+            val i = decoder.dequeueInputBuffer(10_000)
+            if (i >= 0) {
+                decoder.getInputBuffer(i)!!.apply { clear(); put(data) }
+                decoder.queueInputBuffer(i, 0, data.size, pts, 0)
+                break
+            }
+            drain(false)
+        }
+        drain(false)
+    }
+
+    fun finish() {
+        while (true) {
+            val i = decoder.dequeueInputBuffer(10_000)
+            if (i >= 0) { decoder.queueInputBuffer(i, 0, 0, 0, MediaCodec.BUFFER_FLAG_END_OF_STREAM); break }
+            drain(false)
+        }
+        drain(true)
+        encoder.signalEndOfInputStream()
+        drainEncoder(true)
+    }
+
+    /** Whether to keep the frame at pts: not before the stream starts, and no closer to the last one kept than maxFps
+     * allows (a quarter frame's leeway, for 29.97 and rounded timestamps). */
+    private fun keep(pts: Long): Boolean {
+        val step = (1e6 / maxFps).toLong()
+        if (pts < 0 || pts < next - step / 4) return false
+        next = maxOf(next, pts) + step
+        return true
+    }
+
+    private fun drain(end: Boolean) {
+        var waits = 0
+        while (true) {
+            drainEncoder(false) // so the encoder has room for the next picture
+            val o = decoder.dequeueOutputBuffer(decoded, if (end) 10_000 else 0)
+            if (o == MediaCodec.INFO_TRY_AGAIN_LATER) {
+                if (!end || ++waits > 100) return
+                continue
+            }
+            if (o < 0) continue // format changed: the surface takes care of it
+            waits = 0
+            val render = decoded.size > 0 && keep(decoded.presentationTimeUs)
+            decoder.releaseOutputBuffer(o, render)
+            if (render) drawer.draw(decoded.presentationTimeUs)
+            if (decoded.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM != 0) return
+        }
+    }
+
+    private fun drainEncoder(end: Boolean) {
+        var waits = 0
+        while (true) {
+            val o = encoder.dequeueOutputBuffer(encoded, if (end) 10_000 else 0)
+            when {
+                o == MediaCodec.INFO_TRY_AGAIN_LATER -> if (!end || ++waits > 100) return
+                o == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED -> {
+                    val f = encoder.outputFormat
+                    val csd = listOf("csd-0", "csd-1").mapNotNull { f.getByteBuffer(it) }
+                        .fold(ByteArray(0)) { acc, b -> acc + ByteArray(b.remaining()).also { b.duplicate().get(it) } }
+                    if (csd.isNotEmpty()) config(csd)
+                }
+                o >= 0 -> {
+                    waits = 0
+                    if (encoded.size > 0) {
+                        val data = ByteArray(encoded.size)
+                        encoder.getOutputBuffer(o)!!.apply { position(encoded.offset); limit(encoded.offset + encoded.size) }.get(data)
+                        if (encoded.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG != 0) config(data)
+                        else output(data, encoded.presentationTimeUs, encoded.flags and MediaCodec.BUFFER_FLAG_KEY_FRAME != 0)
+                    }
+                    encoder.releaseOutputBuffer(o, false)
+                    if (encoded.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM != 0) return
+                }
+            }
+        }
+    }
+
+    fun release() {
+        if (::decoder.isInitialized) runCatching { decoder.stop(); decoder.release() }
+        runCatching { encoder.stop() }
+        runCatching { encoder.release() }
+        drawer.release()
+    }
+}
+
+/** An H.264 encoder fed from a surface, at the Apple TV 3's profile and level unless the encoder refuses those
+ * (strict), or null if it won't take the size at all. Without B-frames, so frames come out in the order shown. */
+private fun h264Encoder(width: Int, height: Int, fps: Double, bitrate: Int, strict: Boolean): MediaCodec? {
+    val format = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, width, height).apply {
+        setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface)
+        setInteger(MediaFormat.KEY_BIT_RATE, bitrate)
+        setFloat(MediaFormat.KEY_FRAME_RATE, fps.toFloat())
+        setFloat(MediaFormat.KEY_I_FRAME_INTERVAL, (SEGMENT / 2).toFloat()) // segments are cut at keyframes
+        setInteger(MediaFormat.KEY_MAX_B_FRAMES, 0)
+        if (strict) {
+            setInteger(MediaFormat.KEY_PROFILE, MediaCodecInfo.CodecProfileLevel.AVCProfileHigh)
+            setInteger(MediaFormat.KEY_LEVEL, MediaCodecInfo.CodecProfileLevel.AVCLevel4)
+        }
+    }
+    val codec = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_VIDEO_AVC)
+    return try {
+        codec.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
+        codec
+    } catch (_: Exception) {
+        codec.release()
+        null
+    }
+}
+
+/** Draws the decoder's pictures onto an encoder's input surface with OpenGL, which scales them to width x height
+ * (and turns, crops and converts their colours as the decoder says). Used from one thread: the one that made it. */
+private class FrameDrawer(private val target: Surface, private val width: Int, private val height: Int) {
+    private val display = EGL14.eglGetDisplay(EGL14.EGL_DEFAULT_DISPLAY)
+    private val context: android.opengl.EGLContext
+    private val window: android.opengl.EGLSurface
+    private val texture: Int
+    private val program: Int
+    private val matrix = FloatArray(16)
+    private val quad = ByteBuffer.allocateDirect(16 * 4).order(ByteOrder.nativeOrder()).asFloatBuffer()
+        .put(floatArrayOf(-1f, -1f, 0f, 0f, 1f, -1f, 1f, 0f, -1f, 1f, 0f, 1f, 1f, 1f, 1f, 1f)) // x, y, u, v
+    private val frames = HandlerThread("transcode-frames").apply { start() }
+    private val lock = Object()
+    private var available = false
+    private val pictures: SurfaceTexture
+    /** Where the decoder draws. */
+    val surface: Surface
+
+    init {
+        val version = IntArray(2)
+        if (!EGL14.eglInitialize(display, version, 0, version, 1)) throw IllegalStateException("OpenGL won't start: ${EGL14.eglGetError()}")
+        val configs = arrayOfNulls<android.opengl.EGLConfig>(1)
+        val count = IntArray(1)
+        EGL14.eglChooseConfig(display, intArrayOf(
+            EGL14.EGL_RED_SIZE, 8, EGL14.EGL_GREEN_SIZE, 8, EGL14.EGL_BLUE_SIZE, 8,
+            EGL14.EGL_RENDERABLE_TYPE, EGL14.EGL_OPENGL_ES2_BIT, EGL_RECORDABLE_ANDROID, 1, EGL14.EGL_NONE,
+        ), 0, configs, 0, 1, count, 0)
+        if (count[0] == 0) throw IllegalStateException("OpenGL has no way to draw for the video encoder.")
+        context = EGL14.eglCreateContext(display, configs[0], EGL14.EGL_NO_CONTEXT, intArrayOf(EGL14.EGL_CONTEXT_CLIENT_VERSION, 2, EGL14.EGL_NONE), 0)
+        window = EGL14.eglCreateWindowSurface(display, configs[0], target, intArrayOf(EGL14.EGL_NONE), 0)
+        if (!EGL14.eglMakeCurrent(display, window, window, context)) throw IllegalStateException("OpenGL won't draw: ${EGL14.eglGetError()}")
+        program = GLES20.glCreateProgram()
+        for ((type, code) in listOf(GLES20.GL_VERTEX_SHADER to VERTEX, GLES20.GL_FRAGMENT_SHADER to FRAGMENT)) {
+            val shader = GLES20.glCreateShader(type)
+            GLES20.glShaderSource(shader, code)
+            GLES20.glCompileShader(shader)
+            GLES20.glAttachShader(program, shader)
+        }
+        GLES20.glLinkProgram(program)
+        val linked = IntArray(1)
+        GLES20.glGetProgramiv(program, GLES20.GL_LINK_STATUS, linked, 0)
+        if (linked[0] == 0) throw IllegalStateException("OpenGL won't take the shaders: ${GLES20.glGetProgramInfoLog(program)}")
+        texture = IntArray(1).also { GLES20.glGenTextures(1, it, 0) }[0]
+        GLES20.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, texture)
+        GLES20.glTexParameteri(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, GLES20.GL_TEXTURE_MIN_FILTER, GLES20.GL_LINEAR)
+        GLES20.glTexParameteri(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, GLES20.GL_TEXTURE_MAG_FILTER, GLES20.GL_LINEAR)
+        GLES20.glTexParameteri(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, GLES20.GL_TEXTURE_WRAP_S, GLES20.GL_CLAMP_TO_EDGE)
+        GLES20.glTexParameteri(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, GLES20.GL_TEXTURE_WRAP_T, GLES20.GL_CLAMP_TO_EDGE)
+        pictures = SurfaceTexture(texture)
+        // Called on its own thread: this one is waiting for it in draw().
+        pictures.setOnFrameAvailableListener({ synchronized(lock) { available = true; lock.notifyAll() } }, Handler(frames.looper))
+        surface = Surface(pictures)
+    }
+
+    /** Draws the picture the decoder just released onto the encoder's surface, to be shown at pts µs. */
+    fun draw(pts: Long) {
+        synchronized(lock) {
+            val until = System.currentTimeMillis() + 5000
+            while (!available) {
+                val left = until - System.currentTimeMillis()
+                if (left <= 0) throw IllegalStateException("The phone's video decoder stopped giving pictures to convert.")
+                lock.wait(left)
+            }
+            available = false
+        }
+        pictures.updateTexImage()
+        pictures.getTransformMatrix(matrix)
+        GLES20.glViewport(0, 0, width, height)
+        GLES20.glClearColor(0f, 0f, 0f, 1f)
+        GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT)
+        GLES20.glUseProgram(program)
+        GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
+        GLES20.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, texture)
+        GLES20.glUniformMatrix4fv(GLES20.glGetUniformLocation(program, "matrix"), 1, false, matrix, 0)
+        for ((name, at) in listOf("position" to 0, "coord" to 2)) {
+            val a = GLES20.glGetAttribLocation(program, name)
+            GLES20.glEnableVertexAttribArray(a)
+            GLES20.glVertexAttribPointer(a, 2, GLES20.GL_FLOAT, false, 16, quad.position(at))
+        }
+        GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4)
+        EGLExt.eglPresentationTimeANDROID(display, window, pts * 1000)
+        EGL14.eglSwapBuffers(display, window)
+    }
+
+    fun release() {
+        runCatching { surface.release() }
+        runCatching { pictures.release() }
+        EGL14.eglMakeCurrent(display, EGL14.EGL_NO_SURFACE, EGL14.EGL_NO_SURFACE, EGL14.EGL_NO_CONTEXT)
+        EGL14.eglDestroySurface(display, window)
+        EGL14.eglDestroyContext(display, context)
+        EGL14.eglReleaseThread()
+        EGL14.eglTerminate(display)
+        runCatching { target.release() }
+        frames.quitSafely()
+    }
+
+    companion object {
+        const val EGL_RECORDABLE_ANDROID = 0x3142
+        const val VERTEX = """
+            uniform mat4 matrix;
+            attribute vec4 position;
+            attribute vec4 coord;
+            varying vec2 at;
+            void main() {
+                gl_Position = position;
+                at = (matrix * coord).xy;
+            }
+        """
+        const val FRAGMENT = """
+            #extension GL_OES_EGL_image_external : require
+            precision mediump float;
+            uniform samplerExternalOES picture;
+            varying vec2 at;
+            void main() {
+                gl_FragColor = texture2D(picture, at);
+            }
+        """
+    }
+}
+
 /** Repackages a video the TV can't take as it is (an MKV, say, or one with subtitles to add) into HLS as it's read,
- * like ffmpeg does on the PC: H.264 copied as it is, sound copied if it's AAC and converted to AAC if not.
+ * like ffmpeg does on the PC: H.264 copied as it is (or other video converted to H.264 that convertFor plays, if
+ * given), sound copied if it's AAC and converted to AAC if not.
  * Resuming, it starts at the keyframe before start seconds in, with times counted from there. */
 class Remuxer(
     private val open: () -> MediaExtractor, val info: Probe, dir: File, copyAudio: Boolean,
-    private val volume: Int = 100, private val start: Double = 0.0,
+    private val volume: Int = 100, private val start: Double = 0.0, private val convertFor: Tv? = null,
 ) {
     private val transcode = info.audio != null && !(copyAudio && info.audio == "aac")
     val writer = HlsWriter(dir, SEGMENT, 0, info.video != null, info.audio != null)
@@ -193,12 +497,14 @@ class Remuxer(
     private fun run() {
         var ex: MediaExtractor? = null
         var transcoder: AudioTranscoder? = null
+        var converter: VideoTranscoder? = null
         try {
             ex = open()
             val sound = ArrayDeque<Pair<ByteArray, Long>>() // waiting to be interleaved with the video
             if (info.videoTrack >= 0) {
                 ex.selectTrack(info.videoTrack)
-                writer.muxer.videoConfig(csd(info.videoFormat, "csd-0") + csd(info.videoFormat, "csd-1"))
+                // Converted video's comes from its encoder.
+                if (convertFor == null) writer.muxer.videoConfig(csd(info.videoFormat, "csd-0") + csd(info.videoFormat, "csd-1"))
             }
             if (start > 0 && info.videoTrack >= 0) {
                 // The keyframe before start, found with the video alone; the sound then starts there too.
@@ -218,6 +524,11 @@ class Remuxer(
                 while (sound.isNotEmpty() && sound.first().second <= dts) sound.removeFirst().let { (a, pts) -> writer.audio(a, pts) }
                 writer.video(f.data, f.pts, dts, f.key)
             }
+            if (convertFor != null && info.videoTrack >= 0) {
+                converter = VideoTranscoder(info.videoFormat!!, convertFor.maxHeight, convertFor.maxFps, writer.muxer::videoConfig) { data, pts, key ->
+                    times.add(Frame(data, pts, key), pts).forEach { (f, dts) -> write(f, dts) }
+                }
+            }
             val buffer = ByteBuffer.allocateDirect(16 shl 20)
             while (!stopped) {
                 val track = ex.sampleTrackIndex
@@ -228,6 +539,7 @@ class Remuxer(
                 buffer.duplicate().apply { position(0); limit(n) }.get(data)
                 val pts = ex.sampleTime - shift
                 when {
+                    track == info.videoTrack && converter != null -> converter.feed(data, pts)
                     track == info.videoTrack -> {
                         val key = ex.sampleFlags and MediaExtractor.SAMPLE_FLAG_SYNC != 0
                         times.add(Frame(data, pts, key), pts).forEach { (f, dts) -> write(f, dts) }
@@ -240,6 +552,7 @@ class Remuxer(
             }
             if (stopped) return
             transcoder?.finish()
+            converter?.finish()
             times.flush().forEach { (f, dts) -> write(f, dts) }
             while (sound.isNotEmpty()) sound.removeFirst().let { (a, pts) -> writer.audio(a, pts) }
             writer.finish()
@@ -247,6 +560,7 @@ class Remuxer(
             if (!stopped) failure = if (e is IllegalStateException && e !is MediaCodec.CodecException) e.message else "Couldn't read the video: $e"
         } finally {
             transcoder?.release()
+            converter?.release()
             ex?.release()
         }
     }

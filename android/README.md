@@ -19,13 +19,16 @@ Play box.
 
 ## What the phone can't do that the PC can
 
-The phone has no ffmpeg, so it never re-encodes video:
+The phone has no ffmpeg; the only video it re-encodes is HEVC for the Apple TV 3:
 
 - Videos the TV can play as they are (MP4s, or H.264 in MKV and other containers, which the phone
   repackages into HLS on the fly) play from the phone. Sound the TV can't play (AC-3, DTS, MP3 on
   Cast…) is converted to AAC when the phone has a decoder for it.
-- Anything needing its picture converted (HEVC on an Apple TV, 10-bit H.264, 4K on an Apple TV, HEVC
-  in MKV on Cast…) has to be played from the PC: the app says so and points to the PC tab.
+- HEVC on an Apple TV 3 is converted to H.264 with the phone's own video decoder and encoder,
+  scaled down to 1080p and 30 fps if it's more (HDR comes out as SDR on Android 12 and later, where
+  the phone's decoder can do that). It needs a phone fast enough to convert it as it plays.
+- Anything else needing its picture converted (10-bit H.264, 4K H.264 on an Apple TV, HEVC in MKV on
+  Cast…) has to be played from the PC: the app says so and points to the PC tab.
 - Subtitle tracks inside a video aren't extracted; subtitle files (`.srt`, `.ass`, `.ssa`, `.vtt`) are.
 - AirPlay 2 devices that require pairing (newer Apple TVs, Macs) only work from the PC.
 

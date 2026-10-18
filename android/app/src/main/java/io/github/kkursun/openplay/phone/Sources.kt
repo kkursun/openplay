@@ -283,8 +283,11 @@ fun probe(source: Source?, url: String): Probe {
     }
 }
 
-/** Whether the TV can play the video's picture and sound as they are, and if not the picture, why. */
-fun plan(info: Probe, tv: Tv): Triple<Boolean, Boolean, String> {
+/** How a video goes to a TV: whether it plays the picture and sound as they are, and if not the picture, why; and
+ * whether the phone converts the picture instead. */
+data class Plan(val copyVideo: Boolean, val copyAudio: Boolean, val why: String, val convertVideo: Boolean = false)
+
+fun plan(info: Probe, tv: Tv): Plan {
     val v = info.video
     val why = when {
         v == null -> ""
@@ -294,5 +297,8 @@ fun plan(info: Probe, tv: Tv): Triple<Boolean, Boolean, String> {
         v == "h264" && info.tenBit -> "the video is 10-bit H.264, which no TV plays" // no TV decodes 10-bit H.264
         else -> ""
     }
-    return Triple(why.isEmpty(), info.audio == null || info.audio in tv.audio, why)
+    // The Apple TV 3 plays no HEVC: the phone's own decoder and encoder convert it to H.264, which also brings it
+    // down to the 1080p and 30 fps it plays.
+    val convert = why.isNotEmpty() && v == "hevc" && tv is AirPlayTv
+    return Plan(why.isEmpty(), info.audio == null || info.audio in tv.audio, why, convert)
 }
