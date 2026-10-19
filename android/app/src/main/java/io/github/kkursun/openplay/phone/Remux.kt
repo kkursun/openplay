@@ -187,7 +187,9 @@ class VideoTranscoder(
     private lateinit var decoder: MediaCodec
     private val decoded = MediaCodec.BufferInfo()
     private val encoded = MediaCodec.BufferInfo()
-    private var next = Long.MIN_VALUE // the earliest a frame can be and still be kept, µs
+    private val rate = FrameRate(maxFps)
+    private var fed = 0 // frames given to the decoder
+    private var made = 0 // and frames out of the encoder
 
     init {
         // Pictures the decoder rotates (phone recordings held upright) come out the other way round.
@@ -247,6 +249,8 @@ class VideoTranscoder(
             drain(false)
         }
         drain(false)
+        // Else the TV waits for the stream forever, without a word.
+        if (++fed > 300 && made == 0) throw IllegalStateException("The phone's video decoder and encoder gave no video converting this one. openplay on a PC can.")
     }
 
     fun finish() {
@@ -260,15 +264,6 @@ class VideoTranscoder(
         drainEncoder(true)
     }
 
-    /** Whether to keep the frame at pts: not before the stream starts, and no closer to the last one kept than maxFps
-     * allows (a quarter frame's leeway, for 29.97 and rounded timestamps). */
-    private fun keep(pts: Long): Boolean {
-        val step = (1e6 / maxFps).toLong()
-        if (pts < 0 || pts < next - step / 4) return false
-        next = maxOf(next, pts) + step
-        return true
-    }
-
     private fun drain(end: Boolean) {
         var waits = 0
         while (true) {
@@ -280,7 +275,7 @@ class VideoTranscoder(
             }
             if (o < 0) continue // format changed: the surface takes care of it
             waits = 0
-            val render = decoded.size > 0 && keep(decoded.presentationTimeUs)
+            val render = decoded.size > 0 && rate.keep(decoded.presentationTimeUs)
             decoder.releaseOutputBuffer(o, render)
             if (render) drawer.draw(decoded.presentationTimeUs)
             if (decoded.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM != 0) return
@@ -305,7 +300,10 @@ class VideoTranscoder(
                         val data = ByteArray(encoded.size)
                         encoder.getOutputBuffer(o)!!.apply { position(encoded.offset); limit(encoded.offset + encoded.size) }.get(data)
                         if (encoded.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG != 0) config(data)
-                        else output(data, encoded.presentationTimeUs, encoded.flags and MediaCodec.BUFFER_FLAG_KEY_FRAME != 0)
+                        else {
+                            made++
+                            output(data, encoded.presentationTimeUs, encoded.flags and MediaCodec.BUFFER_FLAG_KEY_FRAME != 0)
+                        }
                     }
                     encoder.releaseOutputBuffer(o, false)
                     if (encoded.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM != 0) return
@@ -319,6 +317,19 @@ class VideoTranscoder(
         runCatching { encoder.stop() }
         runCatching { encoder.release() }
         drawer.release()
+    }
+}
+
+/** Which frames to keep to play at no more than maxFps: none before the stream starts (pts 0), and none closer to the
+ * last one kept than a frame at maxFps (with a quarter frame's leeway, for 29.97 and rounded timestamps). */
+class FrameRate(maxFps: Double) {
+    private val step = (1e6 / maxFps).toLong()
+    private var next = 0L // the earliest the next frame kept can be, µs
+
+    fun keep(pts: Long): Boolean {
+        if (pts < 0 || pts < next - step / 4) return false
+        next = maxOf(next, pts) + step
+        return true
     }
 }
 
