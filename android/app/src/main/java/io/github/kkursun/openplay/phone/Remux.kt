@@ -209,32 +209,29 @@ class VideoTranscoder(
             throw e
         }
         encoder.start()
-        decoder = try {
-            openDecoder(format, hdrToSdr = true) ?: openDecoder(format, hdrToSdr = false)!!
-        } catch (e: Exception) {
+        // HDR video is asked to come out as SDR (Android 12 on, if the decoder can), as the Apple TV 3 shows nothing
+        // else; and the decoder to run as fast as it can. Without either if it refuses.
+        val hdr = format.getInteger(MediaFormat.KEY_COLOR_TRANSFER, 0) in setOf(MediaFormat.COLOR_TRANSFER_ST2084, MediaFormat.COLOR_TRANSFER_HLG)
+        val sdr = { f: MediaFormat ->
+            if (hdr && Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) f.setInteger(MediaFormat.KEY_COLOR_TRANSFER_REQUEST, MediaFormat.COLOR_TRANSFER_SDR_VIDEO)
+        }
+        decoder = openDecoder(format) { sdr(it); fast(it) } ?: openDecoder(format) { sdr(it) } ?: openDecoder(format) {} ?: run {
             release()
             throw IllegalStateException("This phone can't decode the video's ${mime.substringAfter('/').uppercase()} picture to convert it. openplay on a PC can.")
         }
     }
 
-    /** A decoder drawing onto the drawer's surface. HDR video is asked to come out as SDR (Android 12 on, if the
-     * decoder can), as the Apple TV 3 shows nothing else; null if the decoder refuses that. */
-    private fun openDecoder(format: MediaFormat, hdrToSdr: Boolean): MediaCodec? {
-        val f = MediaFormat(format)
-        if (hdrToSdr) {
-            val hdr = f.getInteger(MediaFormat.KEY_COLOR_TRANSFER, 0) in setOf(MediaFormat.COLOR_TRANSFER_ST2084, MediaFormat.COLOR_TRANSFER_HLG)
-            if (!hdr || Build.VERSION.SDK_INT < Build.VERSION_CODES.S) return null
-            f.setInteger(MediaFormat.KEY_COLOR_TRANSFER_REQUEST, MediaFormat.COLOR_TRANSFER_SDR_VIDEO)
-        }
-        val codec = MediaCodec.createDecoderByType(mime)
-        try {
+    /** A decoder drawing onto the drawer's surface, with change made to its format; null if it refuses that. */
+    private fun openDecoder(format: MediaFormat, change: (MediaFormat) -> Unit): MediaCodec? {
+        val f = MediaFormat(format).also(change)
+        val codec = try { MediaCodec.createDecoderByType(mime) } catch (_: Exception) { return null }
+        return try {
             codec.configure(f, drawer.surface, null, 0)
             codec.start()
-            return codec
-        } catch (e: Exception) {
+            codec
+        } catch (_: Exception) {
             codec.release()
-            if (hdrToSdr) return null
-            throw e
+            null
         }
     }
 
@@ -333,6 +330,12 @@ class FrameRate(maxFps: Double) {
     }
 }
 
+/** Asks a codec to run as fast as it can, rather than at the pace of playing, which is how fast it's converted. */
+private fun fast(format: MediaFormat) {
+    format.setInteger(MediaFormat.KEY_PRIORITY, 1) // not real time
+    format.setInteger(MediaFormat.KEY_OPERATING_RATE, Short.MAX_VALUE.toInt()) // Android's way of saying "flat out"
+}
+
 /** An H.264 encoder fed from a surface, at the Apple TV 3's profile and level unless the encoder refuses those
  * (strict), or null if it won't take the size at all. Without B-frames, so frames come out in the order shown. */
 private fun h264Encoder(width: Int, height: Int, fps: Double, bitrate: Int, strict: Boolean): MediaCodec? {
@@ -345,6 +348,7 @@ private fun h264Encoder(width: Int, height: Int, fps: Double, bitrate: Int, stri
         if (strict) {
             setInteger(MediaFormat.KEY_PROFILE, MediaCodecInfo.CodecProfileLevel.AVCProfileHigh)
             setInteger(MediaFormat.KEY_LEVEL, MediaCodecInfo.CodecProfileLevel.AVCLevel4)
+            fast(this)
         }
     }
     val codec = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_VIDEO_AVC)
@@ -493,6 +497,9 @@ class Remuxer(
     /** Seconds into the video the stream starts at: 0, or where resuming started (known before any segment is). */
     @Volatile var offset = 0.0
         private set
+    /** How many times faster than it plays the video is converted, 0 until it's known (or if it isn't converted). */
+    @Volatile var speed = 0.0
+        private set
 
     private class Frame(val data: ByteArray, val pts: Long, val key: Boolean)
 
@@ -536,7 +543,10 @@ class Remuxer(
                 writer.video(f.data, f.pts, dts, f.key)
             }
             if (convertFor != null && info.videoTrack >= 0) {
+                val began = System.nanoTime()
                 converter = VideoTranscoder(info.videoFormat!!, convertFor.maxHeight, convertFor.maxFps, writer.muxer::videoConfig) { data, pts, key ->
+                    val took = (System.nanoTime() - began) / 1e9
+                    if (took > 2) speed = pts / 1e6 / took
                     times.add(Frame(data, pts, key), pts).forEach { (f, dts) -> write(f, dts) }
                 }
             }

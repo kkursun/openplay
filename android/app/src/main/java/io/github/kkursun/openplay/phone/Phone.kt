@@ -135,7 +135,7 @@ object Phone {
         val pickOnTv = subtitles.isNotEmpty() && tv?.picksSubtitles == false
         _state.value = PhoneState(
             status, error, since, job,
-            listOf(file?.describe() ?: "", if (pickOnTv) "Subtitles: hold the center button on the Apple TV remote to pick" else "")
+            listOf(file?.describe() ?: "", converting(), if (pickOnTv) "Subtitles: hold the center button on the Apple TV remote to pick" else "")
                 .filter { it.isNotEmpty() }.joinToString(" · "),
             devices.values.map { Device(it.name, it.model, it.address) }, scanning,
             if (tv?.picksSubtitles == true) subtitles.map { it.name } else emptyList(), subtitle,
@@ -144,6 +144,12 @@ object Phone {
             downloads.walkTopDown().filter { it.isFile }.sumOf { it.length() },
             history, settings, volume,
         )
+    }
+
+    /** How the conversion of a video's picture is going, if it's converted. */
+    private fun converting(): String {
+        val speed = remux?.speed ?: 0.0
+        return if (speed > 0) String.format(Locale.ROOT, "Converting to H.264 at %.1f× playing speed", speed) else ""
     }
 
     /** Changes the settings. Another video starts at its first episode unless the change names one. */
@@ -245,11 +251,13 @@ object Phone {
             }
             refresh()
             var missing = 0
-            while (missing < 8) {
+            var seen = false // playing: until then the TV may be loading a while, more so a video the phone converts
+            while (missing < if (seen) 8 else 60) {
                 delay(1000)
                 problem()?.let { throw IllegalStateException(it) }
                 val alive = (if (url.isEmpty()) air?.alive() else runInterruptible { tv.alive() }) ?: break
                 missing = if (alive) 0 else missing + 1
+                seen = seen || alive
                 if (played && alive && System.currentTimeMillis() - saved > 15_000) {
                     leftOff(s.source, episode, position(), length())
                     saved = System.currentTimeMillis()
