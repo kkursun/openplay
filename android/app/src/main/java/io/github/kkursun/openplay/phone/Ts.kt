@@ -341,6 +341,35 @@ class HlsWriter(
     }
 }
 
+/** Feeds a writer video in decode order with presentation times only (as MediaExtractor and encoders give it) and
+ * sound, however far the sound runs ahead (a video decoder and encoder hold frames back): each frame goes out with
+ * its decode time, and the sound up to that time just before it. */
+class Interleaver(private val writer: HlsWriter, private val hasVideo: Boolean) {
+    private class Frame(val data: ByteArray, val pts: Long, val key: Boolean)
+
+    private val times = DecodeTimes<Frame>()
+    private val sound = ArrayDeque<Pair<ByteArray, Long>>() // ADTS frames and their pts, waiting for the video
+
+    fun video(accessUnit: ByteArray, ptsUs: Long, key: Boolean) =
+        times.add(Frame(accessUnit, ptsUs, key), ptsUs).forEach { (f, dts) -> write(f, dts) }
+
+    fun audio(adtsFrame: ByteArray, ptsUs: Long) {
+        if (hasVideo) sound.addLast(adtsFrame to ptsUs) else writer.audio(adtsFrame, ptsUs)
+    }
+
+    /** Writes out what's left and ends the stream. */
+    fun finish() {
+        times.flush().forEach { (f, dts) -> write(f, dts) }
+        while (sound.isNotEmpty()) sound.removeFirst().let { (a, pts) -> writer.audio(a, pts) }
+        writer.finish()
+    }
+
+    private fun write(f: Frame, dts: Long) {
+        while (sound.isNotEmpty() && sound.first().second <= dts) sound.removeFirst().let { (a, pts) -> writer.audio(a, pts) }
+        writer.video(f.data, f.pts, dts, f.key)
+    }
+}
+
 /** Decode timestamps for video read in decode order with presentation times only (all MediaExtractor gives): the
  * presentation times in increasing order, moved back by however far the first frames are reordered. */
 class DecodeTimes<T>(private val window: Int = 32) {

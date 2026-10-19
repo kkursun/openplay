@@ -107,6 +107,53 @@ class TsTest {
         assertTrue(muxed.zipWithNext().all { (a, b) -> b[1] > a[1] })
     }
 
+    /** Converted video as the phone muxes it: frames out of the encoder in order, without B-frames, but well behind
+     * the sound read alongside the source (the decoder and encoder hold frames back), at 23.976 fps with times
+     * rounded to the millisecond like an MKV's. */
+    @Test
+    fun convertedVideoLateBehindTheSound() {
+        val src = arrayOf("-f", "lavfi", "-i", "testsrc2=size=320x180:rate=24000/1001:duration=10", "-f", "lavfi", "-i", "sine=duration=10:sample_rate=48000")
+        run("ffmpeg", "-v", "error", *src, "-map", "0", "-c:v", "libx264", "-bf", "0", "-g", "48", "-bsf:v", "h264_metadata=aud=insert", "-f", "h264", "v.h264")
+        run("ffmpeg", "-v", "error", *src, "-map", "1", "-c:a", "aac", "-f", "adts", "a.aac")
+        val video = accessUnits(File(dir, "v.h264").readBytes())
+        val audio = adtsFrames(File(dir, "a.aac").readBytes())
+        assertEquals(240, video.size)
+        val out = File(dir, "hls").apply { mkdirs() }
+        val writer = HlsWriter(out, SEGMENT, 0, hasVideo = true, hasAudio = true)
+        writer.muxer.videoConfig(video[0])
+        val mux = Interleaver(writer, hasVideo = true)
+        val pts = { i: Int -> i * 1_001_000_000L / 24000 / 1000 * 1000 } // whole milliseconds
+        // The source as read: video and sound in time order. Each video frame comes out of the encoder 20 later.
+        val read = video.indices.map { pts(it) to it } + audio.indices.map { it * 1024 * 1_000_000L / 48000 to -1 - it }
+        val held = ArrayDeque<Int>()
+        for ((t, n) in read.sortedBy { it.first }) {
+            if (n < 0) { mux.audio(audio[-1 - n], t); continue }
+            held.addLast(n)
+            if (held.size > 20) held.removeFirst().let { mux.video(video[it], pts(it), it % 48 == 0) }
+        }
+        held.forEach { mux.video(video[it], pts(it), it % 48 == 0) }
+        mux.finish()
+
+        assertEquals("", run("ffmpeg", "-v", "warning", "-i", "hls/live.m3u8", "-f", "null", "-"))
+        assertEquals(240, frames("hls/live.m3u8"))
+        val segments = Regex("live\\d+\\.ts").findAll(File(out, "live.m3u8").readText()).map { it.value }.toList()
+        assertEquals(listOf("live0.ts", "live1.ts", "live2.ts"), segments) // a keyframe every 2 s, cut after 4
+        var sound = 0
+        for (segment in segments) {
+            // Each segment holds the sound of its own stretch of the video (players fetch them one by one), to within
+            // 0.1 s (ffprobe's AAC parser also puts sound a frame later than it is).
+            val packets = run("ffprobe", "-v", "error", "-show_entries", "packet=codec_type,pts,dts", "-of", "csv=p=0", "hls/$segment")
+                .lines().filter { it.isNotBlank() }.map { it.split(",") }
+            val v = packets.filter { it[0] == "video" }.map { it[2].toLong() }
+            val a = packets.filter { it[0] == "audio" }.map { it[1].toLong() }
+            assertTrue(segment, v.zipWithNext().all { (x, y) -> y > x })
+            assertTrue("$segment: sound starts at ${a.first()}, video at ${v.first()}", a.first() in v.first()..v.first() + 9000)
+            assertTrue("$segment: sound ends at ${a.last()}, video at ${v.last()}", a.last() in v.last() - 9000..v.last() + 9000)
+            sound += a.size
+        }
+        assertTrue("$sound of ${audio.size} sound frames", sound >= audio.size - 2) // only what came before the first frame left out
+    }
+
     @Test
     fun decodeTimesStayBehindAndRise() {
         val pts = listOf(0L, 3, 1, 2, 6, 4, 5, 9, 7, 8).map { it * 40_000 }

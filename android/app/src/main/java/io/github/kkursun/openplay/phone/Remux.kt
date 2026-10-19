@@ -528,8 +528,6 @@ class Remuxer(
         return String.format(Locale.ROOT, "Converting to H.264 (%s%s) at %.1f× playing speed", v.size, level, speed)
     }
 
-    private class Frame(val data: ByteArray, val pts: Long, val key: Boolean)
-
     fun start() = Thread(::run, "remux").apply { isDaemon = true }.start()
 
     fun stop() {
@@ -545,7 +543,7 @@ class Remuxer(
         var converter: VideoTranscoder? = null
         try {
             ex = open()
-            val sound = ArrayDeque<Pair<ByteArray, Long>>() // waiting to be interleaved with the video
+            val mux = Interleaver(writer, info.videoTrack >= 0)
             if (info.videoTrack >= 0) {
                 ex.selectTrack(info.videoTrack)
                 // Converted video's comes from its encoder.
@@ -562,19 +560,14 @@ class Remuxer(
             if (offset > 0) ex.seekTo((offset * 1e6).toLong(), MediaExtractor.SEEK_TO_PREVIOUS_SYNC)
             val shift = (offset * 1e6).toLong()
             val asc = if (transcode || info.audioTrack < 0) null else TsMuxer.audioConfig(csd(info.audioFormat, "csd-0"))
-            if (transcode) transcoder = AudioTranscoder(info.audioFormat!!, volume) { frame, pts -> sound.addLast(frame to pts) }
+            if (transcode) transcoder = AudioTranscoder(info.audioFormat!!, volume, mux::audio)
             if (asc != null && asc.first == 5) writer.audioCodec = "mp4a.40.5"
-            val times = DecodeTimes<Frame>()
-            val write = { f: Frame, dts: Long ->
-                while (sound.isNotEmpty() && sound.first().second <= dts) sound.removeFirst().let { (a, pts) -> writer.audio(a, pts) }
-                writer.video(f.data, f.pts, dts, f.key)
-            }
             if (convertFor != null && info.videoTrack >= 0) {
                 val began = System.nanoTime()
                 converter = VideoTranscoder(info.videoFormat!!, convertFor.maxHeight, convertFor.maxFps, writer.muxer::videoConfig) { data, pts, key ->
                     val took = (System.nanoTime() - began) / 1e9
                     if (took > 2) speed = pts / 1e6 / took
-                    times.add(Frame(data, pts, key), pts).forEach { (f, dts) -> write(f, dts) }
+                    mux.video(data, pts, key)
                 }
                 video = converter
             }
@@ -589,22 +582,16 @@ class Remuxer(
                 val pts = ex.sampleTime - shift
                 when {
                     track == info.videoTrack && converter != null -> converter.feed(data, pts)
-                    track == info.videoTrack -> {
-                        val key = ex.sampleFlags and MediaExtractor.SAMPLE_FLAG_SYNC != 0
-                        times.add(Frame(data, pts, key), pts).forEach { (f, dts) -> write(f, dts) }
-                    }
+                    track == info.videoTrack -> mux.video(data, pts, ex.sampleFlags and MediaExtractor.SAMPLE_FLAG_SYNC != 0)
                     transcoder != null -> transcoder.feed(data, pts)
-                    asc != null -> sound.addLast(TsMuxer.adts(data, asc.first, asc.second, asc.third) to pts)
+                    asc != null -> mux.audio(TsMuxer.adts(data, asc.first, asc.second, asc.third), pts)
                 }
-                if (info.videoTrack < 0) while (sound.isNotEmpty()) sound.removeFirst().let { (a, p) -> writer.audio(a, p) }
                 ex.advance()
             }
             if (stopped) return
             transcoder?.finish()
             converter?.finish()
-            times.flush().forEach { (f, dts) -> write(f, dts) }
-            while (sound.isNotEmpty()) sound.removeFirst().let { (a, pts) -> writer.audio(a, pts) }
-            writer.finish()
+            mux.finish()
         } catch (e: Exception) { // MediaExtractor and MediaCodec throw all sorts
             if (!stopped) failure = if (e is IllegalStateException && e !is MediaCodec.CodecException) e.message else "Couldn't read the video: $e"
         } finally {
