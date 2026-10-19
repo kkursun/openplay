@@ -17,6 +17,7 @@ import android.view.Surface
 import java.io.File
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
+import java.util.Locale
 import kotlin.math.roundToInt
 
 /** Stereo 16-bit PCM in, ADTS frames of AAC-LC out, through output(frame, pts µs). */
@@ -181,6 +182,11 @@ class VideoTranscoder(
     format: MediaFormat, maxHeight: Int, private val maxFps: Double,
     private val config: (ByteArray) -> Unit, private val output: (ByteArray, Long, Boolean) -> Unit,
 ) {
+    /** The size it's converted to, like "1920×800". */
+    val size: String
+    /** The H.264 level the encoder says its stream needs (41 for 4.1), 0 until known. */
+    @Volatile var level = 0
+        private set
     private val mime = format.getString(MediaFormat.KEY_MIME)!!
     private val drawer: FrameDrawer
     private val encoder: MediaCodec
@@ -200,7 +206,10 @@ class VideoTranscoder(
         val width = (w * scale / 2).roundToInt() * 2 // encoders want even sizes
         val height = (h * scale / 2).roundToInt() * 2
         val bitrate = (width * height * maxFps * 0.14).toInt().coerceIn(2_000_000, 10_000_000) // ~8.7 Mbps at 1080p30
-        encoder = h264Encoder(width, height, maxFps, bitrate, strict = true) ?: h264Encoder(width, height, maxFps, bitrate, strict = false)
+        size = "$width×$height"
+        encoder = h264Encoder(width, height, maxFps, bitrate, strict = true, fast = true)
+            ?: h264Encoder(width, height, maxFps, bitrate, strict = true, fast = false)
+            ?: h264Encoder(width, height, maxFps, bitrate, strict = false, fast = false)
             ?: throw IllegalStateException("This phone's video encoder won't take ${width}x$height to convert the video. openplay on a PC can.")
         try {
             drawer = FrameDrawer(encoder.createInputSurface(), width, height)
@@ -289,17 +298,18 @@ class VideoTranscoder(
                     val f = encoder.outputFormat
                     val csd = listOf("csd-0", "csd-1").mapNotNull { f.getByteBuffer(it) }
                         .fold(ByteArray(0)) { acc, b -> acc + ByteArray(b.remaining()).also { b.duplicate().get(it) } }
-                    if (csd.isNotEmpty()) config(csd)
+                    if (csd.isNotEmpty()) config(capped(csd))
                 }
                 o >= 0 -> {
                     waits = 0
                     if (encoded.size > 0) {
                         val data = ByteArray(encoded.size)
                         encoder.getOutputBuffer(o)!!.apply { position(encoded.offset); limit(encoded.offset + encoded.size) }.get(data)
-                        if (encoded.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG != 0) config(data)
+                        val key = encoded.flags and MediaCodec.BUFFER_FLAG_KEY_FRAME != 0
+                        if (encoded.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG != 0) config(capped(data))
                         else {
                             made++
-                            output(data, encoded.presentationTimeUs, encoded.flags and MediaCodec.BUFFER_FLAG_KEY_FRAME != 0)
+                            output(if (key) capped(data) else data, encoded.presentationTimeUs, key)
                         }
                     }
                     encoder.releaseOutputBuffer(o, false)
@@ -307,6 +317,14 @@ class VideoTranscoder(
                 }
             }
         }
+    }
+
+    /** H.264 from the encoder with its SPS saying level 4.0 at most, the highest the Apple TV 3 plays. Encoders say
+     * higher levels than they need (asked to run flat out, more so), though 1080p at 30 fps and this bitrate is
+     * within 4.0's limits. */
+    private fun capped(annexB: ByteArray): ByteArray {
+        TsMuxer.capLevel(annexB, 40).let { if (it > 0) level = it }
+        return annexB
     }
 
     fun release() {
@@ -336,9 +354,9 @@ private fun fast(format: MediaFormat) {
     format.setInteger(MediaFormat.KEY_OPERATING_RATE, Short.MAX_VALUE.toInt()) // Android's way of saying "flat out"
 }
 
-/** An H.264 encoder fed from a surface, at the Apple TV 3's profile and level unless the encoder refuses those
- * (strict), or null if it won't take the size at all. Without B-frames, so frames come out in the order shown. */
-private fun h264Encoder(width: Int, height: Int, fps: Double, bitrate: Int, strict: Boolean): MediaCodec? {
+/** An H.264 encoder fed from a surface, at the Apple TV 3's profile and level (strict) and flat out (fast), or null
+ * if it refuses those. Without B-frames, so frames come out in the order shown. */
+private fun h264Encoder(width: Int, height: Int, fps: Double, bitrate: Int, strict: Boolean, fast: Boolean): MediaCodec? {
     val format = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, width, height).apply {
         setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface)
         setInteger(MediaFormat.KEY_BIT_RATE, bitrate)
@@ -348,8 +366,8 @@ private fun h264Encoder(width: Int, height: Int, fps: Double, bitrate: Int, stri
         if (strict) {
             setInteger(MediaFormat.KEY_PROFILE, MediaCodecInfo.CodecProfileLevel.AVCProfileHigh)
             setInteger(MediaFormat.KEY_LEVEL, MediaCodecInfo.CodecProfileLevel.AVCLevel4)
-            fast(this)
         }
+        if (fast) fast(this)
     }
     val codec = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_VIDEO_AVC)
     return try {
@@ -500,6 +518,15 @@ class Remuxer(
     /** How many times faster than it plays the video is converted, 0 until it's known (or if it isn't converted). */
     @Volatile var speed = 0.0
         private set
+    @Volatile private var video: VideoTranscoder? = null
+
+    /** How converting the video is going, "" if it isn't converted (or hasn't started). */
+    fun describe(): String {
+        val v = video ?: return ""
+        if (speed <= 0) return ""
+        val level = if (v.level > 0) String.format(Locale.ROOT, ", encoder's level %.1f", v.level / 10.0) else ""
+        return String.format(Locale.ROOT, "Converting to H.264 (%s%s) at %.1f× playing speed", v.size, level, speed)
+    }
 
     private class Frame(val data: ByteArray, val pts: Long, val key: Boolean)
 
@@ -549,6 +576,7 @@ class Remuxer(
                     if (took > 2) speed = pts / 1e6 / took
                     times.add(Frame(data, pts, key), pts).forEach { (f, dts) -> write(f, dts) }
                 }
+                video = converter
             }
             val buffer = ByteBuffer.allocateDirect(16 shl 20)
             while (!stopped) {

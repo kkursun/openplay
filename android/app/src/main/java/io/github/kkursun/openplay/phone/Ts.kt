@@ -142,6 +142,23 @@ class TsMuxer(private val hasVideo: Boolean, private val hasAudio: Boolean) {
 
         fun nalType(nal: ByteArray) = nal[0].toInt() and 0x1F
 
+        /** Lowers the level the H.264 SPS in Annex B data says the stream needs to at most level (40 for 4.0), in
+         * place. Returns the level it said, 0 if it holds no SPS. */
+        fun capLevel(annexB: ByteArray, level: Int): Int {
+            var said = 0
+            var i = 0
+            while (i + 6 < annexB.size) {
+                if (annexB[i].toInt() == 0 && annexB[i + 1].toInt() == 0 && annexB[i + 2].toInt() == 1 && annexB[i + 3].toInt() and 0x1F == 7) {
+                    said = annexB[i + 6].toInt() and 0xFF // after the NAL header, profile_idc and the constraint flags
+                    if (said > level) annexB[i + 6] = level.toByte()
+                    i += 7
+                } else {
+                    i++
+                }
+            }
+            return said
+        }
+
         /** The NAL units of H.264 in Annex B (start codes) or, failing that, as 4-byte lengths before each. */
         fun nalUnits(data: ByteArray): List<ByteArray> {
             val starts = mutableListOf<Int>() // first byte after each start code

@@ -135,7 +135,7 @@ object Phone {
         val pickOnTv = subtitles.isNotEmpty() && tv?.picksSubtitles == false
         _state.value = PhoneState(
             status, error, since, job,
-            listOf(file?.describe() ?: "", converting(), if (pickOnTv) "Subtitles: hold the center button on the Apple TV remote to pick" else "")
+            listOf(file?.describe() ?: "", remux?.describe() ?: "", if (pickOnTv) "Subtitles: hold the center button on the Apple TV remote to pick" else "")
                 .filter { it.isNotEmpty() }.joinToString(" · "),
             devices.values.map { Device(it.name, it.model, it.address) }, scanning,
             if (tv?.picksSubtitles == true) subtitles.map { it.name } else emptyList(), subtitle,
@@ -144,12 +144,6 @@ object Phone {
             downloads.walkTopDown().filter { it.isFile }.sumOf { it.length() },
             history, settings, volume,
         )
-    }
-
-    /** How the conversion of a video's picture is going, if it's converted. */
-    private fun converting(): String {
-        val speed = remux?.speed ?: 0.0
-        return if (speed > 0) String.format(Locale.ROOT, "Converting to H.264 at %.1f× playing speed", speed) else ""
     }
 
     /** Changes the settings. Another video starts at its first episode unless the change names one. */
