@@ -22,7 +22,19 @@ class Stream(
     val subtitles: List<Subtitle> = emptyList(), // served from subN.vtt in dir
     val writer: HlsWriter? = null,
     val offset: () -> Double = { 0.0 }, // seconds into the video live.m3u8 starts at (resumed partway)
-)
+) {
+    private val started = System.currentTimeMillis()
+    private val requests = ArrayDeque<String>()
+
+    /** Notes a request the TV made and the answer, for a report on why a stream didn't play. */
+    fun log(method: String, path: String, code: Int, bytes: Int) = synchronized(requests) {
+        requests.addLast(String.format(java.util.Locale.ROOT, "%7.1f s  %s %s -> %d, %d bytes", (System.currentTimeMillis() - started) / 1000.0, method, path, code, bytes))
+        if (requests.size > 300) requests.removeFirst()
+    }
+
+    /** The requests noted, oldest first. */
+    fun requests(): List<String> = synchronized(requests) { requests.toList() }
+}
 
 /** Serves the stream to the TV over HTTP, as mirror.py's Handler does on the PC. */
 class StreamServer {
@@ -46,6 +58,9 @@ class StreamServer {
     }
 
     private class Reply(val out: OutputStream) {
+        var code = 0
+        var size = 0
+
         fun send(code: Int, type: String = "text/plain", body: ByteArray = ByteArray(0), extra: Map<String, String> = emptyMap(), head: Boolean = false) {
             val status = mapOf(200 to "OK", 204 to "No Content", 206 to "Partial Content", 403 to "Forbidden", 404 to "Not Found", 416 to "Range Not Satisfiable")
             val headers = StringBuilder("HTTP/1.1 $code ${status[code] ?: ""}\r\n")
@@ -55,6 +70,8 @@ class StreamServer {
             out.write(headers.append("\r\n").toString().toByteArray())
             if (!head) out.write(body)
             out.flush()
+            this.code = code
+            size = body.size
         }
     }
 
@@ -83,6 +100,8 @@ class StreamServer {
             }
         } catch (_: IOException) {
             // the player hung up (it does on every seek), or playback stopped
+        } finally {
+            if (st != null && c.inetAddress == st.client) st.log(method, path, reply.code, reply.size)
         }
     }
 

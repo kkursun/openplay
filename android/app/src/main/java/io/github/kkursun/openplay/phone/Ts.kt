@@ -16,6 +16,9 @@ class TsMuxer(private val hasVideo: Boolean, private val hasAudio: Boolean) {
         config = nalUnits(annexB).filter { nalType(it) == 7 || nalType(it) == 8 }
     }
 
+    /** The SPS and PPS put before keyframes. */
+    val parameterSets: List<ByteArray> get() = config
+
     /** The codec name HLS master playlists use for the video ("avc1.64001F"), from its SPS. */
     fun videoCodec(): String = config.firstOrNull { nalType(it) == 7 && it.size >= 4 }
         ?.let { String.format(Locale.ROOT, "avc1.%02X%02X%02X", it[1], it[2], it[3]) } ?: ""

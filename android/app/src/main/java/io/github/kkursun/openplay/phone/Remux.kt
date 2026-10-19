@@ -184,6 +184,10 @@ class VideoTranscoder(
 ) {
     /** The size it's converted to, like "1920×800". */
     val size: String
+    /** The decoder's and encoder's names, like "c2.qti.hevc.decoder" (decoder known once it's open). */
+    val codecs: String get() = (if (::decoder.isInitialized) decoder.name else "?") + " -> " + encoder.name
+    /** NAL unit types of the first few frames out of the encoder ("5 6" is an IDR slice with SEI), and their sizes. */
+    val firstFrames = mutableListOf<String>()
     /** The H.264 level the encoder says its stream needs (41 for 4.1), 0 until known. */
     @Volatile var level = 0
         private set
@@ -309,6 +313,10 @@ class VideoTranscoder(
                         if (encoded.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG != 0) config(capped(data))
                         else {
                             made++
+                            if (firstFrames.size < 8) synchronized(firstFrames) {
+                                firstFrames += "pts ${encoded.presentationTimeUs} key=$key ${data.size} bytes, NAL types " +
+                                    TsMuxer.nalUnits(data).joinToString(" ") { TsMuxer.nalType(it).toString() }
+                            }
                             output(if (key) capped(data) else data, encoded.presentationTimeUs, key)
                         }
                     }
@@ -518,7 +526,9 @@ class Remuxer(
     /** How many times faster than it plays the video is converted, 0 until it's known (or if it isn't converted). */
     @Volatile var speed = 0.0
         private set
-    @Volatile private var video: VideoTranscoder? = null
+    /** The video converter, while converting. */
+    @Volatile var video: VideoTranscoder? = null
+        private set
 
     /** How converting the video is going, "" if it isn't converted (or hasn't started). */
     fun describe(): String {

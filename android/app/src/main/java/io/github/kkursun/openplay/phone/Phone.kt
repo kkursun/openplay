@@ -1,11 +1,14 @@
 package io.github.kkursun.openplay.phone
 
 import android.annotation.SuppressLint
+import android.content.ContentValues
 import android.content.Context
 import android.content.SharedPreferences
 import android.media.projection.MediaProjection
 import androidx.core.content.edit
 import androidx.core.net.toUri
+import android.os.Environment
+import android.provider.MediaStore
 import android.provider.OpenableColumns
 import io.github.kkursun.openplay.Finder
 import kotlinx.coroutines.CancellationException
@@ -247,6 +250,11 @@ object Phone {
             var missing = 0
             var seen = false // playing: until then the TV may be loading a while, more so a video the phone converts
             while (missing < if (seen) 8 else 60) {
+                if (!seen && missing == 59) {
+                    val report = runCatching { if (remux?.video != null) report(s, tv, out) else null }.getOrNull()
+                    throw IllegalStateException("${tv.name} never started playing." +
+                        (report?.let { " A report on it is in $it, for fixing it." } ?: ""))
+                }
                 delay(1000)
                 problem()?.let { throw IllegalStateException(it) }
                 val alive = (if (url.isEmpty()) air?.alive() else runInterruptible { tv.alive() }) ?: break
@@ -286,6 +294,52 @@ object Phone {
                 refresh()
             }
         }
+    }
+
+    /** Saves what's known about a converted stream the TV wouldn't play to Download/openplay-debug/<time>: the TV's
+     * requests and its last word, the playlists, the encoder's output, and the first segments to look at with
+     * ffprobe. Returns the folder. */
+    private fun report(s: PhoneSettings, tv: Tv, out: File): String {
+        val remux = remux ?: return ""
+        val writer = remux.writer
+        val folder = Environment.DIRECTORY_DOWNLOADS + "/openplay-debug/" +
+            java.text.SimpleDateFormat("yyyyMMdd-HHmmss", Locale.ROOT).format(java.util.Date())
+        val save = { name: String, data: ByteArray ->
+            val values = ContentValues().apply {
+                put(MediaStore.Downloads.DISPLAY_NAME, name)
+                put(MediaStore.Downloads.RELATIVE_PATH, folder)
+            }
+            val uri = context.contentResolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values)
+            if (uri != null) context.contentResolver.openOutputStream(uri)?.use { it.write(data) }
+        }
+        val hex = { b: ByteArray -> b.joinToString("") { "%02x".format(it) } }
+        val info = remux.info
+        val video = remux.video
+        val master = masterPlaylist(subtitles, writer.peakBitrate(), writer.codecs())
+        val playlist = runCatching { File(out, "live.m3u8").readText() }.getOrDefault("(none)")
+        val text = buildString {
+            append("openplay ${runCatching { context.packageManager.getPackageInfo(context.packageName, 0).versionName }.getOrNull()}, ")
+            append("Android ${android.os.Build.VERSION.RELEASE}, ${android.os.Build.MANUFACTURER} ${android.os.Build.MODEL}\n")
+            append("TV: ${tv.name} (${tv.model})\nVideo: ${file?.name ?: s.source}\n")
+            append("Source: video ${info.video} ${info.height}p ${info.fps} fps, 10-bit H.264 ${info.tenBit}, audio ${info.audio}, mp4 ${info.mp4}\n")
+            append("Source video format: ${info.videoFormat}\nSource audio format: ${info.audioFormat}\n")
+            if (video != null) {
+                append("Converting: ${video.size}, ${video.codecs}, encoder's level ${video.level}, ${remux.speed}x\n")
+                append("First frames out of the encoder:\n")
+                synchronized(video.firstFrames) { video.firstFrames.forEach { append("  $it\n") } }
+            }
+            append("Parameter sets sent: ${writer.muxer.parameterSets.joinToString(" ") { hex(it) }}\n")
+            append("Segments written: ${writer.count}, failure: ${remux.failure}\n")
+            append("\nThe TV's last /playback-info: ${(tv as? AirPlayTv)?.info}\n")
+            append("\nThe TV's requests:\n")
+            server.stream?.requests()?.forEach { append("  $it\n") }
+            append("\nmaster.m3u8 (served if there are subtitles: ${subtitles.isNotEmpty()}):\n$master\nlive.m3u8:\n$playlist\n")
+        }
+        save("report.txt", text.toByteArray())
+        save("master.m3u8", master.toByteArray())
+        save("live.m3u8", playlist.toByteArray())
+        for (n in 0..1) File(out, "live$n.ts").takeIf { it.exists() }?.let { save(it.name, it.readBytes()) }
+        return folder.replace(Environment.DIRECTORY_DOWNLOADS, "Download")
     }
 
     private suspend fun mirror(s: PhoneSettings, tv: Tv, projection: MediaProjection, sound: Boolean, out: File, token: String): Triple<String, String, () -> String?> {

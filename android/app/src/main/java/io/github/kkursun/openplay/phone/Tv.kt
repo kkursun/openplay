@@ -55,6 +55,8 @@ class AirPlayTv(
     private var input: InputStream? = null
     @Volatile override var position = 0.0
     @Volatile override var duration = 0.0
+    /** What /playback-info last said, for a report on why a stream didn't play. */
+    @Volatile var info = ""
     private var skipTo = 0.0 // once it plays: it takes Start-Position as a fraction of a length it doesn't know yet
 
     override fun play(url: String, contentType: String, live: Boolean, start: Double) {
@@ -82,6 +84,7 @@ class AirPlayTv(
         } catch (_: IOException) {
             return null // the TV dropped the connection: stopped from the remote
         }
+        this.info = info.toString()
         val map = info as? Map<*, *> ?: return false
         map["error"]?.let { throw IllegalStateException("Apple TV playback error: $it") }
         // The TV leaves out "duration" while loading and during brief rebuffers, not just after Menu is pressed.
